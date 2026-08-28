@@ -1,6 +1,24 @@
+[Manifest]
+Version = 1
+MinRux = "0.4.0"
+
 [Package]
+Namespace = "Rux"
 Name = "Time"
 Version = "0.1.0"
-Type = "Source"
-Description = "Durations, monotonic clocks, and wall clocks"
+Type = "SourceLibrary"
+Description = "Durations, monotonic clocks and wall clocks"
 Authors = ["Rux Contributors <info@rux-lang.dev>"]
+Keywords = ["Time", "Duration", "Clock", "Instant", "Calendar"]
+License = "MIT"
+LicenseFile = "LICENSE.md"
+Repository = "https://github.com/rux-lang/Rux"
+Homepage = "https://rux-lang.dev/docs/api/time"
+ReadmeFile = "README.md"
+
+[Dependencies]
+Core = { Namespace = "Rux", Version = "0.1.0" }
+FreeBSD = { Namespace = "Rux", Version = "0.1.0", TargetOS = ["FreeBSD"] }
+Linux = { Namespace = "Rux", Version = "0.1.0", TargetOS = ["Linux"] }
+macOS = { Namespace = "Rux", Version = "0.1.0", TargetOS = ["macOS"] }
+Windows = { Namespace = "Rux", Version = "0.1.0", TargetOS = ["Windows"] }

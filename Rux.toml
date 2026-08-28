@@ -1,21 +1,36 @@
+[Manifest]
+Version = 1
+MinRux = "0.4.0"
+
 [Workspace]
 Packages = [
     "Packages/Algorithms",
-    "Packages/Bsd",
+    "Packages/Allocator",
+    "Packages/Benchmark",
     "Packages/C",
     "Packages/Collections",
+    "Packages/Core",
+    "Packages/Crypto",
+    "Packages/Entropy",
     "Packages/Format",
+    "Packages/FreeBSD",
     "Packages/Hash",
     "Packages/Io",
     "Packages/Json",
     "Packages/Linux",
-    "Packages/MacOS",
+    "Packages/macOS",
     "Packages/Math",
     "Packages/Memory",
+    "Packages/Path",
     "Packages/Random",
-    "Packages/Rux",
+    "Packages/Simd",
+    "Packages/Storage",
+    "Packages/Sync",
     "Packages/Text",
+    "Packages/Thread",
     "Packages/Time",
+    "Packages/Toml",
+    "Packages/Unicode",
     "Packages/Uuid",
     "Packages/Windows",
 ]

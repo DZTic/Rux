@@ -19,6 +19,7 @@ TokenKind KeywordKind(const std::string_view text) noexcept {
         {"continue", TokenKind::ContinueKeyword},
         {"return", TokenKind::ReturnKeyword},
         {"match", TokenKind::MatchKeyword},
+        {"defer", TokenKind::DeferKeyword},
         {"intrinsic", TokenKind::IntrinsicKeyword},
         {"func", TokenKind::FuncKeyword},
         {"let", TokenKind::LetKeyword},
@@ -86,6 +87,8 @@ std::string_view TokenKindName(const TokenKind kind) noexcept {
         return "ReturnKeyword";
     case TokenKind::MatchKeyword:
         return "MatchKeyword";
+    case TokenKind::DeferKeyword:
+        return "DeferKeyword";
     case TokenKind::IntrinsicKeyword:
         return "IntrinsicKeyword";
     case TokenKind::FuncKeyword:
@@ -156,6 +159,8 @@ std::string_view TokenKindName(const TokenKind kind) noexcept {
         return "DotDotEqual";
     case TokenKind::Arrow:
         return "Arrow";
+    case TokenKind::MoveArrow:
+        return "MoveArrow";
     case TokenKind::FatArrow:
         return "FatArrow";
     case TokenKind::At:
@@ -174,8 +179,6 @@ std::string_view TokenKindName(const TokenKind kind) noexcept {
         return "Slash";
     case TokenKind::Percent:
         return "Percent";
-    case TokenKind::StarStar:
-        return "StarStar";
     case TokenKind::PlusPlus:
         return "PlusPlus";
     case TokenKind::MinusMinus:
@@ -236,6 +239,8 @@ std::string_view TokenKindName(const TokenKind kind) noexcept {
         return "GreaterGreaterAssign";
     case TokenKind::GreaterGreaterGreaterAssign:
         return "GreaterGreaterGreaterAssign";
+    case TokenKind::DocComment:
+        return "DocComment";
     case TokenKind::NewLine:
         return "NewLine";
     case TokenKind::EndOfFile:

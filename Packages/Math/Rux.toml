@@ -1,6 +1,20 @@
+[Manifest]
+Version = 1
+MinRux = "0.4.0"
+
 [Package]
+Namespace = "Rux"
 Name = "Math"
 Version = "0.1.0"
-Type = "Source"
+Type = "SourceLibrary"
 Description = "Mathematical constants and functions"
 Authors = ["Rux Contributors <info@rux-lang.dev>"]
+Keywords = ["Math", "Numerics", "Constants", "FloatingPoint", "Elementary"]
+License = "MIT"
+LicenseFile = "LICENSE.md"
+Repository = "https://github.com/rux-lang/Rux"
+Homepage = "https://rux-lang.dev/docs/api/math"
+ReadmeFile = "README.md"
+
+[Dependencies]
+Core = { Namespace = "Rux", Version = "0.1.0" }

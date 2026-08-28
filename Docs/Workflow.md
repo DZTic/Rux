@@ -4,13 +4,13 @@ The day-to-day loop for changing the Rux compiler. For where your branch should 
 
 ## 1. Prerequisites
 
-Install the toolchain (Clang 22.1+ including `clang-format`, CMake 3.30+, Ninja 1.11+, and a recent Git) for your OS — see [Building from Source](../README.md#building-from-source). Install `clang-tidy` from the same LLVM 22 release when you want to run static analysis locally.
+Install the toolchain (upstream Clang 22.1+ including `clang-format`, CMake 3.30+, Ninja 1.11+, and a recent Git) for your OS — see [Building from Source](../README.md#building-from-source). Rux supports only upstream Clang as its C++ compiler, and configuration rejects any other compiler or older release. Install `clang-tidy` from the same LLVM 22 release when you want to run static analysis locally.
 
 The LLVM tools have distinct roles:
 
 - **`clang-format`** enforces C++ layout.
 - **`clang-tidy`** enforces the static-analysis baseline in [`.clang-tidy`](../.clang-tidy).
-- **Editor / IDE** setup is optional. The build scripts enable `CMAKE_EXPORT_COMPILE_COMMANDS`, producing `Build/compile_commands.json` for clang-tidy, clangd, and other tools.
+- **Editor / IDE** setup is optional. The `build` command enables `CMAKE_EXPORT_COMPILE_COMMANDS`, producing `Build/compile_commands.json` for clang-tidy, clangd, and other tools.
 
 ## 2. Get the Source and Configure
 
@@ -42,9 +42,25 @@ With no `-DCMAKE_BUILD_TYPE`, the project defaults to a **Release** build (set i
    ./Bin/rux test --release
    ctest --test-dir Build --output-on-failure -C Release
    ```
-6. **Format** all maintained C++ and Rux sources: `sh Format.sh` (PowerShell: `./Format.ps1`).
+6. **Format** all maintained C++ and Rux sources: `sh Run.sh format` (PowerShell: `./Run.ps1 format`).
 
-The repository provides matching platform entry points. PowerShell users can run `./Build.ps1`, `./Format.ps1`, and `./Test.ps1`; Linux, macOS, and FreeBSD users can run `sh Build.sh`, `sh Format.sh`, and `sh Test.sh`. The build scripts configure and build the compiler and C++ test target while generating the compilation database. The format scripts handle maintained C++ and Rux sources. The test scripts run the policy, formatting, build, CTest, lint, and Rux-test workflow. Use `./Test.ps1 -SkipBuild` or `sh Test.sh --skip-build` to reuse an existing build. Add `-ClangTidy` or `--clang-tidy` for the slower static-analysis pass; the Code Quality workflow always runs it.
+The repository provides one entry point per shell family: `./Run.ps1` on PowerShell and `sh Run.sh` on Linux, macOS, and FreeBSD. Each takes a single command — `build`, `test`, `format`, `policy`, `tidy`, `unit`, `clean`, or `help` — and prints its command and option summary when run with no arguments. `build` configures and builds the compiler and C++ test target while generating the compilation database. `format` handles maintained C++ and Rux sources. `test` runs the policy, build, formatting, CTest, check, lint, and Rux-test workflow, composing the same step functions the standalone commands use, so a step behaves identically alone and in the workflow. `policy`, `tidy`, and `unit` expose those individual steps for a fast inner loop, and `clean` removes the build directory and `Bin/`. `Scripts/RepositoryMessages.ps1` and `Scripts/RepositoryMessages.sh` keep each shell family's progress verbs, pass/fail labels, tool discovery, child-command handling, and duration formatting in one place; the two families expose the same user-facing vocabulary, file/package counts, quoted paths, and canonical duration units (`ms`, `s`, or `min` plus `s`), and both drop ANSI styling when output is redirected or `NO_COLOR` is set. A failed child command identifies the command and retains its failure status. An option a command does not accept is rejected rather than ignored. Use `./Run.ps1 test -SkipBuild` or `sh Run.sh test --skip-build` to reuse an existing build; the workflow reports the selected existing build directory. Add `-ClangTidy` or `--clang-tidy` for the slower static-analysis pass; the Code Quality workflow always runs it. `rux run` is host-only and has no `--target` option. A `-Target` / `--target` test run is allowed only for the host OS and an architecture the compiler process or native OS can execute directly. This supports an x86-64 compiler process on AArch64 Windows and under Rosetta on Apple Silicon; a physical x86-64 host should use `rux build --target` and `rux check --target`, then test the output on its native machine.
+
+The same rule applies to FreeBSD AArch64. Every supported host can build or check `freebsd-aarch64`; Release output lands below `Bin/Release/FreeBSD/AArch64/`. Only FreeBSD with an AArch64 compiler process or native OS can use `test --target freebsd-aarch64`. For cross-runtime work, use `Tests/Native/FreeBSDAArch64/BuildTransfer.sh` on x86-64 FreeBSD and `VerifyTransfer.sh` in a separate AArch64 FreeBSD checkout so the compiler and target-runtime boundaries stay explicit.
+
+For package profile and target selection, ordinary artifact paths, and the complete `rux build --all` contract, see [Package Builds and the Target Matrix](Builds.md).
+
+### Ownership-facing changes
+
+Changes to values, references, constructors, special operations, or cleanup cross several compiler boundaries. Keep the decision in the stage that owns it and test each affected boundary:
+
+- Parser and dump tests cover the written syntax; semantic tests cover reference escape, loan conflicts, mutability, copy/move capability, definite initialization, and diagnostics.
+- Lowering tests cover interface views, scratch-copy replacement, source invalidation, drop flags, partial construction, and cleanup on every control-flow exit. Backend tests cover concrete and interface-reference ABI shapes rather than re-deciding ownership.
+- A user-visible behavior change gets an executable package under `Tests/Language/`; a rejected legacy spelling stays as a focused negative or golden diagnostic fixture.
+- Safe call-time parameters and receivers use `&T` or `&var T`. Keep `*T` and `*var T` only for FFI, nullable values, stored addresses, pointer arithmetic, raw storage, or an intentionally unsafe API, and state that boundary in the affected package README.
+- Named ownership transfers use `<-`; copyable values use `=`. Resource owners prohibit copying and provide `~Type`; infallible exact-type construction uses `Type(...)`, while fallible or descriptive factories keep their names.
+
+When a diagnostic changes, regenerate and review every affected golden file. When a package API changes, update its tests, README, API comments, and examples in the same change.
 
 ### Debug vs. Release Builds
 
@@ -55,32 +71,34 @@ There are **no sanitizer presets** wired into `CMakeLists.txt`. If you want ASan
 
 ## 4. Repository Layout
 
-| Path                    | Purpose                                                                         |
-| ----------------------- | ------------------------------------------------------------------------------- |
-| `Compiler/Cli/`         | Command-line interface and terminal presentation                                |
-| `Compiler/Diagnostics/` | Diagnostic values, severities, and rendering primitives                         |
-| `Compiler/Driver/`      | Compilation orchestration, targets, and build reports                           |
-| `Compiler/Source/`      | Source discovery, loading, and locations                                        |
-| `Compiler/Lexer/`       | Tokens and lexical analysis                                                     |
-| `Compiler/Syntax/`      | AST and parser                                                                  |
-| `Compiler/Semantic/`    | Types, symbols, analysis, and the persistent semantic model                     |
-| `Compiler/Ir/`          | HIR/LIR models, printers, and IR-local passes                                   |
-| `Compiler/Lowering/`    | Explicit AST-to-HIR and HIR-to-LIR transformations                              |
-| `Compiler/CodeGen/`     | Target-specific code generation                                                 |
-| `Compiler/Object/`      | Object formats and serialization                                                |
-| `Compiler/Linker/`      | PE, ELF, and Mach-O executable writers                                          |
-| `Compiler/Target/`      | Compilation target, ABI, data-layout, and architecture model                    |
-| `Compiler/System/`      | Host OS, hardware, filesystem, and process services                             |
-| `Compiler/Package/`     | Manifest parsing and package management                                         |
-| `Compiler/Formatter/`   | Formatting engine used by `rux fmt`                                             |
-| `Compiler/Linter/`      | Lint engine and rules used by `rux lint`                                        |
-| `Tests/Language/`       | Executable Rux language and compiler-behavior tests (`rux test`)                |
-| `Tests/Packages/`       | Executable first-party package tests grouped as `<Package>/<Test>` (`rux test`) |
-| `Tests/Unit/`           | C++ unit tests and their `Golden/` diagnostic fixtures (doctest + CTest)        |
-| `Tests/Policy/`         | Repository-policy checks, including platform isolation                          |
-| `Packaging/`            | Linux and Windows installer scripts plus the Windows MSI project                |
-| `Bin/`                  | Compiler and centralized test executables; **git-ignored**                      |
-| `CMakeLists.txt`        | Top-level build entry: project `VERSION` + `add_subdirectory(Compiler)`         |
+| Path                    | Purpose                                                                                           |
+| ----------------------- | ------------------------------------------------------------------------------------------------- |
+| `Compiler/Cli/`         | Command-line interface and terminal presentation                                                  |
+| `Compiler/Diagnostics/` | Diagnostic values, severities, and rendering primitives                                           |
+| `Compiler/Driver/`      | Compilation orchestration, targets, and build reports                                             |
+| `Compiler/SourceModel/` | Source locations and loaded-file identity values                                                  |
+| `Compiler/Source/`      | Source discovery and loading                                                                      |
+| `Compiler/Lexer/`       | Tokens and lexical analysis                                                                       |
+| `Compiler/Syntax/`      | AST and parser                                                                                    |
+| `Compiler/Semantic/`    | Types, symbols, analysis, and the persistent semantic model                                       |
+| `Compiler/Ir/`          | HIR/LIR models, printers, and IR-local passes                                                     |
+| `Compiler/Lowering/`    | Explicit AST-to-HIR and HIR-to-LIR transformations                                                |
+| `Compiler/CodeGen/`     | Target-specific code generation                                                                   |
+| `Compiler/Object/`      | Object formats and serialization                                                                  |
+| `Compiler/Linker/`      | PE, ELF, Mach-O, relocatable-object, and archive writers                                          |
+| `Compiler/Target/`      | Compilation target, ABI, data-layout, and architecture model                                      |
+| `Compiler/System/`      | Host OS, hardware, filesystem, and process services                                               |
+| `Compiler/Package/`     | Manifest parsing and package management                                                           |
+| `Compiler/Formatter/`   | Formatting engine used by `rux fmt`                                                               |
+| `Compiler/Linter/`      | Lint engine and rules used by `rux lint`                                                          |
+| `Tests/Language/`       | Executable Rux language and compiler-behavior tests (`rux test`)                                  |
+| `Tests/Packages/`       | Executable first-party package tests grouped as `<Package>/<Test>` (`rux test`)                   |
+| `Tests/Unit/`           | C++ unit tests and their `Golden/` diagnostic fixtures (doctest + CTest)                          |
+| `Tests/Policy/`         | Repository-policy checks: language cutover, platform isolation, toolchain use, and file ownership |
+| `Tests/Native/`         | Target-specific end-to-end fixtures driven by platform scripts                                    |
+| `Packaging/`            | Linux and Windows installer scripts plus the Windows MSI project                                  |
+| `Bin/`                  | Compiler and centralized test executables; **git-ignored**                                        |
+| `CMakeLists.txt`        | Top-level build entry: project `VERSION` + `add_subdirectory(Compiler)`                           |
 
 `Bin/` contains every repository executable. The compiler builds directly to `Bin/rux` (`Bin\rux.exe` on Windows), the C++ unit runner to `Bin/Tests/Unit/rux-tests`, language tests to `Bin/Tests/Language/`, and package tests to `Bin/Tests/Packages/<Package>/`. Test executables are written directly to those corresponding directories without `Debug` or `Release` subdirectories. CMake intermediates stay in the build directory passed to `-B`. `Bin/` is listed in `.gitignore`; nothing under it is tracked.
 
@@ -88,29 +106,60 @@ There are **no sanitizer presets** wired into `CMakeLists.txt`. If you want ASan
 
 A source file flows through these stages, front to back. Each stage owns a small set of files, so this is the map for "where do I make this change?":
 
-| Stage             | File(s)                           | Role                                     |
-| ----------------- | --------------------------------- | ---------------------------------------- |
-| Source loading    | `Source/SourceLoader.cpp`         | Locate and read source files             |
-| Lexing            | `Lexer/Lexer.cpp`                 | Source text → token stream               |
-| Parsing           | `Syntax/Parser/`                  | Tokens → AST                             |
-| Semantic analysis | `Semantic/SemanticAnalyzer.cpp`   | AST → validated `SemanticModel`          |
-| HIR lowering      | `Lowering/AstToHir/`              | Semantic model → HIR                     |
-| HIR passes        | `Ir/Hir/Passes/`                  | HIR optimization                         |
-| LIR lowering      | `Lowering/HirToLir/`              | HIR → control-flow-explicit LIR          |
-| Code generation   | `CodeGen/{X86_64,AArch64}/`       | LIR → target-native representation       |
-| Object emission   | `Object/Rcu/`                     | x86-64 RCU serialization and diagnostics |
-| Linking           | `Linker/{Pe,Elf,MachO}/` or Clang | Objects/LIR lowering → target executable |
+| Stage             | File(s)                                      | Role                                   |
+| ----------------- | -------------------------------------------- | -------------------------------------- |
+| Source loading    | `Source/SourceLoader.cpp`                    | Locate and read source files           |
+| Lexing            | `Lexer/Lexer.cpp`                            | Source text → token stream             |
+| Parsing           | `Syntax/Parser/`                             | Tokens → AST                           |
+| Semantic analysis | `Semantic/` analyzer implementation files    | AST → validated `SemanticModel`        |
+| HIR lowering      | `Lowering/AstToHir/`                         | Semantic model → HIR                   |
+| HIR passes        | `Ir/Hir/Passes/`                             | HIR optimization                       |
+| LIR lowering      | `Lowering/HirToLir/`                         | HIR → control-flow-explicit LIR        |
+| Code generation   | `CodeGen/{X86_64,AArch64}/`                  | LIR → target-native representation     |
+| Object emission   | `Object/Rcu/`                                | RCU serialization and diagnostics      |
+| Linking           | `Linker/{Pe,Elf,MachO}/` and archive writers | Objects/LIR lowering → target artifact |
 
 Supporting layers around the pipeline:
 
 - **CLI & driver** — `Main.cpp`, `Cli/`, `Driver/CompilerDriver.cpp`, build reports, and target selection.
 - **Packages & manifests** — `Package/Package.cpp`, `Package/Manifest.cpp` (parse `Rux.toml`, resolve dependencies).
-- **Target and system layers** — `Target/` models the machine being compiled for; `System/` isolates services of the host running the compiler. Direct OS
-  API calls (`getenv`, `<windows.h>`, `fork`, ...) are allowed only in `System/`; CI enforces this with `Tests/Policy/PlatformIsolation/Check.sh`.
+- **Target and system layers** — `Target/` models the machine being compiled for; `System/` isolates services of the host running the compiler. Direct OS API calls (`getenv`, `<windows.h>`, `fork`, ...) are allowed only in `System/`; CI enforces this with `Tests/Policy/PlatformIsolation/Check.sh`.
+- **No external toolchain** — the compiler assembles, links, and signs its own artifacts, so nothing under `Compiler/` may name or launch an assembler, C compiler, linker, archiver, or signing tool. `Tests/Policy/NoExternalToolchain/Check.sh` enforces that, with the remaining exceptions listed at the top of the script.
+- **Final language ownership** — positive package and language-test sources cannot restore mutable parameters, `Core::Drop` lifecycle forms, or infallible exact-type `New` factories. `Tests/Policy/LanguageCutover/Check.sh` also pins the parser diagnostic and semantic rejection path that keep mutable parameters and implicit named moves rejected; its adjacent fixture script tests every pass and failure rule.
+- **User-message ownership** — reusable compiler/package code returns failures and diagnostics; `Compiler/Cli/` owns process streams, `CliSupport::Reporter` owns semantic human presentation, and `Reporting::FormatDuration` owns C++ duration grammar. `Tests/Policy/UserMessages/Check.sh` names the file, line, rule, approved helper, and remediation for raw printing outside those owners, ad hoc duration text, obsolete CLI-documentation links, ANSI-capable JSON owners, capitalized severity prefixes, and external-toolchain suggestions. Its reasoned allowlist covers only stable inspection, machine, generated, and relayed user-program output.
+- **Bounded implementation files** — C and C++ translation units, headers, and include fragments under `Compiler/` and `Tests/Unit/` have a 1,200-line architecture guideline. `Tests/Policy/OversizedFiles/Check.sh` reports every larger file and rejects unreviewed paths or growth beyond a reviewed path-specific ceiling. A cohesive owner, dense vector table, generated source, or vendored dependency may keep its locality when the exception records why a split would make the ownership or data harder to audit.
+
+### User-Facing Message Contract
+
+The CLI owns user-facing toolchain messages. Reusable compiler, package, system, and runtime components return structured failures or diagnostics; they do not print. Use `CliSupport::Reporter` for semantic command output, `RenderDiagnostic` for source diagnostics, and `Reporting::FormatDuration` for elapsed time.
+
+Canonical diagnostics use this shape:
+
+```text
+Src/Main.rux:12:9: error: cannot assign a string to 'count', which has type 'int'
+  note: 'count' was declared as 'int' on line 4
+  help: convert the value to 'int' or change the declared type
+  docs: https://rux-lang.dev/docs/variables/
+```
+
+When adding or changing messages:
+
+- Start with the subject and cause. Put corrective action in `help:`, supporting context in `note:`, and verified documentation in `docs:`.
+- Spell `error:`, `warning:`, `note:`, `help:`, and `docs:` in lowercase; start their text in lowercase and omit a final period on a single-line message. Quote user-provided names, paths, options, targets, versions, and commands with single quotes.
+- Use present participles for progress (`Compiling`, `Checking`, `Downloading`) and concise past tense for outcomes (`Built`, `Checked`, `Installed`, `Removed`). Format elapsed time as `25 ms`, `1.25 s`, or `1 min 5.2 s`.
+- Name profiles and targets in display spelling in report prose — `Compiling App v0.1.0 (Debug, Windows x86-64)`, via `Driver::FormatBuildContext`. Reserve canonical IDs such as `windows-x86_64` for text naming a value the reader could pass back on the command line. See the [target ID rules](Builds.md#profiles-and-targets).
+- Render a titled block of aligned rows with `Reporting::RenderSection`, or `Reporter::Summary` when writing straight to a stream. Both size the label column to the block, so no report hard-codes a column width.
+- Green indicates success, yellow a warning, red an error or failure, cyan progress or links, and dim text supporting detail. Honor `--color`, `NO_COLOR`, `TERM=dumb`, and terminal detection.
+- `--quiet` suppresses progress, success, tips, and summaries, but never errors. `--verbose` adds phase and path detail without repeating the normal summary.
+- JSON modes write only their compatible JSON schema to stdout and never include ANSI styling. Diagnostics and warnings remain on stderr. Commands that launch user programs keep toolchain status off the program's stdout.
+- Dedicated CLI pages exist below `https://rux-lang.dev/docs/cli/<command>` for `add`, `build`, `clean`, `doc`, `fmt`, `help`, `init`, `install`, `list`, `new`, `remove`, `run`, `test`, `uninstall`, `update`, and `version`. Use `https://rux-lang.dev/docs/cli` for `check`, `info`, `lint`, `login`, `logout`, `pack`, and `publish` until dedicated pages exist. Do not invent a route.
+- Preserve token, AST, semantic, HIR, LIR, assembly, RCU, generated-documentation, and relayed user-program formats. Add a narrowly matched entry with a reason to `Tests/Policy/UserMessages/Allowlist.txt` when a stable compatibility payload needs direct output.
 
 ## 5. Testing
 
-There are two suites: Rux-language test packages (run with `rux test`) and C++ unit tests for the compiler internals (run with `ctest`).
+There are two broad suites: Rux-language/package tests (run with `rux test`) and C++ unit tests for the compiler internals (run with `ctest`). Target-specific native fixtures supplement them where a complete OS interaction needs a dedicated driver script.
+
+`sh Run.sh test` and `./Run.ps1 test` first run all repository-policy guards; `sh Run.sh policy` and `./Run.ps1 policy` run that step alone. The language-cutover fixtures cover final parameter syntax, lifecycle declarations, constructor factories, and explicit named moves. The oversized-file guard has its own shell contract tests, which exercise the ordinary limit, unreviewed files, reviewed ceilings, stale exceptions, and path-specific third-party handling without modifying the source tree. `Tests/Policy/ScriptMessages/Check.sh` smoke-tests repository-script help, unknown commands and misapplied options, prerequisite and child-command failures, format check/fix modes, redirected no-color output, and the key message labels shared by the PowerShell and POSIX entry points. `Tests/Policy/InstallerMessages/Check.sh` covers native-architecture selection, explicit/latest releases, download and extraction failures, PATH/profile handling, Windows user-PATH ownership, MSI downgrade recovery, and timed success output. The user-message policy has seeded passing and failing fixtures for each rule, including the requirement that every compatibility exception state its category and reason.
 
 ### Language and Package Tests (`Tests/Language/`, `Tests/Packages/`)
 
@@ -140,12 +189,13 @@ func Main() -> int {
 Each language test lives at `Tests/Language/<Name>/` with a `Rux.toml` manifest and `Src/Main.rux`:
 
 ```toml
+[Manifest]
 Version = 1
 
 [Package]
 Name = "Arithmetic"
 Version = "0.1.0"
-Type = "Program"
+Type = "Executable"
 Description = "Language test: Arithmetic"
 
 [Build]
@@ -155,6 +205,12 @@ Output = "../../../Bin/Tests/Language"
 **When you add a language feature, add a matching test package under `Tests/Language/`.**
 
 Package tests live at `Tests/Packages/<Package>/<Test>/`. Their manifests use local path dependencies back to the package they cover and direct output to the corresponding central binary folder. For example, a Math test uses `Math = { Path = "../../../../Packages/Math" }` and `Output = "../../../../Bin/Tests/Packages/Math"`.
+
+### Native End-to-End Fixtures (`Tests/Native/`)
+
+Native fixtures use `Fixture.toml` so `rux test` does not discover them as ordinary packages. Their platform script builds a specific target, launches the result only on compatible native hardware, and verifies OS-visible behavior such as an exact exit code, assertion or panic output, C ABI calls, stack probing, or loading and calling an exported shared-library function. The Windows AArch64 cross job runs the exit-code and DLL fixtures with an x86-64 compiler on an AArch64 OS; the native and release jobs repeat them with the native compiler. On Apple Silicon, `Tests/Native/MacOSAArch64/Verify.sh` runs the macOS ARM64 fixture set with a native compiler, while `VerifyRosetta.sh` runs an x86-64 compiler under Rosetta and launches the produced ARM64 images directly. The scripts reject Intel Macs and inspect the Mach-O architecture and in-process ad-hoc signature before execution. Linux and Windows use `VerifyCross.ps1` for non-executing smoke coverage: it builds signed `macos-aarch64` executable and dylib fixtures twice, verifies deterministic bytes, parses their ARM64 Mach-O structures, and recomputes every CodeDirectory SHA-256 page hash.
+
+FreeBSD also tests a transferred cross-compiler workflow. An x86-64 FreeBSD VM runs `Tests/Native/FreeBSDAArch64/BuildTransfer.sh` with the x86-64 Rux compiler. The script builds the representative AArch64 fixtures into canonical `freebsd-aarch64` output directories and creates a payload containing only the target executables, shared library, and a manifest of names, SHA-256 hashes, modes, ELF kinds, and expected outcomes. A separate AArch64 FreeBSD VM installs no compiler, restores modes from that manifest, verifies every hash and ELF identity, and launches the transferred bytes through `VerifyTransfer.sh`. Linux x86-64 separately runs `VerifyCross.sh` to build and inspect a FreeBSD AArch64 executable and static archive without a FreeBSD sysroot. QEMU belongs to the CI VM provider; Rux never discovers or launches an emulator.
 
 ### Unit Tests (`Tests/Unit/`)
 
@@ -166,32 +222,31 @@ cmake --build Build --config Release
 ctest --test-dir Build --output-on-failure -C Release
 ```
 
-The unit-test executable is written to `Bin/Tests/Unit/rux-tests` (`rux-tests.exe` on Windows); CTest resolves that path automatically.
+`sh Run.sh unit` and `./Run.ps1 unit` run the same CTest invocation against an existing build. The unit-test executable is written to `Bin/Tests/Unit/rux-tests` (`rux-tests.exe` on Windows); CTest resolves that path automatically.
 
 Run the centralized binary directly for doctest filtering, for example `Bin/Tests/Unit/rux-tests -ts="Lexer*"` (with `.exe` on Windows).
 
 ### Golden Diagnostics (`Tests/Unit/Golden/`)
 
-Part of the unit-test binary: every `Tests/Unit/Golden/<Case>.rux` is compiled through the frontend (lex → parse → sema), the diagnostics are rendered one per line as `line:column: severity: message`, and compared against `<Case>.expected`. To add a case, drop a `.rux` file in `Tests/Unit/Golden/`, run the test binary once with `RUX_UPDATE_GOLDEN=1` to generate the `.expected` file, and review it before committing. **When you change or add a diagnostic, add or regenerate the affected golden cases.**
+Part of the unit-test binary: every `Tests/Unit/Golden/<Case>.rux` is compiled through the frontend (lex → parse → sema), the diagnostics are rendered one per line as `line:column: severity: message`, and compared against `<Case>.expected`. This stable one-line serialization deliberately omits structured `note:`, `help:`, and `docs:` context; those fields are covered by diagnostic renderer tests instead. A case opening with `// rux:target <triple>` is compiled for that target instead of the host, so a diagnostic about a foreign machine reads the same everywhere; a case compiled for AArch64 additionally has every `asm func` a clean frontend leaves behind run through the AArch64 assembler, so inline-assembly reports are golden cases too. To add a case, drop a `.rux` file in `Tests/Unit/Golden/`, run the test binary once with `RUX_UPDATE_GOLDEN=1` to generate the `.expected` file, and review it before committing. **When you change or add a diagnostic, add or regenerate the affected golden cases.**
 
 ## 6. Code Style
 
-Formatting is enforced by [`.clang-format`](../.clang-format) for C++ (LLVM base, 4-space indent, west const, 120-column limit) and by `rux fmt` for Rux sources. The repository scripts format all maintained sources:
+Formatting is enforced by [`.clang-format`](../.clang-format) for C++ (LLVM base, 4-space indent, west const, 120-column limit) and by `rux fmt` for Rux sources. The repository entry point formats all maintained sources:
 
 ```sh
-sh Format.sh
+sh Run.sh format
 ```
 
 PowerShell equivalent:
 
 ```powershell
-./Format.ps1
+./Run.ps1 format
 ```
 
-Use `sh Format.sh --check` or `./Format.ps1 -Check` to verify formatting without changing files. Vendored C++ under `Tests/Unit/ThirdParty/` and intentionally malformed Rux diagnostic fixtures under `Tests/Unit/Golden/` are excluded.
+Use `sh Run.sh format --check` or `./Run.ps1 format -Check` to verify formatting without changing files. Vendored C++ under `Tests/Unit/ThirdParty/` and intentionally malformed Rux diagnostic fixtures under `Tests/Unit/Golden/` are excluded.
 
-The formatters handle layout; the conventions they can't enforce, observed
-throughout the codebase:
+The formatters handle layout; the conventions they can't enforce, observed throughout the codebase:
 
 - **Naming**
   - Files, types (`struct`/`class`/`enum`), and free/member functions are `PascalCase` — `Parser`, `ParseResult`, `EmitError()`.

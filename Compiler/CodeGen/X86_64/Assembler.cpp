@@ -14,8 +14,8 @@
 // immediates, or memory references of the form [base + index*scale +/- disp],
 // optionally with a byte/word/dword/qword size prefix.
 
-#include "CodeGen/X86_64/Assembler.h"
-
+#include "CodeGen/BackendDiagnostics.h"
+#include "CodeGen/X86_64/AssemblerSupport.h"
 #include "Object/Rcu/Rcu.h"
 
 #include <cstdint>
@@ -27,9 +27,10 @@
 namespace Rux {
 namespace {
 using Bytes = std::vector<std::uint8_t>;
+using namespace X86_64AssemblerPrivate;
 
-// Resolved r/m encoding: the ModRM byte with an empty reg field, plus the SIB,
-// displacement, REX.B/X bits, and any rip-relative symbol reference.
+/// Resolved r/m encoding: the ModRM byte with an empty reg field, plus the SIB, displacement, REX.B/X bits, and any
+/// rip-relative symbol reference.
 struct RmEnc {
     std::uint8_t modrm = 0;
     bool hasSib = false;
@@ -46,100 +47,79 @@ struct RmEnc {
 
 class Assembler {
 public:
-    Assembler(const std::vector<AsmInstr> &instrs, std::string sourceName, Bytes &out)
-        : instrs_(instrs)
-        , sourceName_(std::move(sourceName))
-        , out_(out) {
+    Assembler(const std::vector<AsmInstr> &inputInstrs, std::string inputSourceName, Bytes &inputOut,
+              const Target::OS inputTargetOs)
+        : instrs(inputInstrs)
+        , sourceName(std::move(inputSourceName))
+        , targetOs(inputTargetOs)
+        , out(inputOut)
+        , labelFixups(sourceName, out, result) {
     }
 
     AsmAssembly Run() {
-        CollectLabels();
-        for (const auto &instr : instrs_) {
+        labelFixups.Collect(instrs);
+        for (const auto &instr : instrs) {
             if (!instr.labelDef.empty()) {
-                labels_[instr.labelDef] = Here();
+                labelFixups.Define(instr.labelDef, Here());
                 continue;
             }
             EncodeInstr(instr);
         }
-        ResolveLocalJumps();
-        result_.ok = result_.diagnostics.empty();
-        return std::move(result_);
+        labelFixups.Resolve();
+        result.ok = result.diagnostics.empty();
+        return std::move(result);
     }
 
 private:
-    const std::vector<AsmInstr> &instrs_;
-    std::string sourceName_;
-    Bytes &out_;
-    AsmAssembly result_;
+    const std::vector<AsmInstr> &instrs;
+    std::string sourceName;
+    Target::OS targetOs;
+    Bytes &out;
+    AsmAssembly result;
+    LabelFixups labelFixups;
 
-    // Label name -> offset within out_ (absolute).
-    std::unordered_map<std::string, std::uint32_t> labels_;
-
-    // Pending rel32 fixups to local labels: (field offset, target label).
-    struct LocalJump {
-        std::uint32_t fieldOff;
-        std::string label;
-        SourceLocation loc;
-    };
-
-    std::vector<LocalJump> localJumps_;
-
-    void Error(const SourceLocation &loc, std::string msg) {
-        Diagnostic d;
-        d.severity = Diagnostic::Severity::Error;
-        d.message = std::move(msg);
+    void Error(const SourceLocation &loc, std::string msg, std::vector<std::string> notes = {},
+               std::optional<std::string> help = {}) {
+        Diagnostic d = ErrorDiagnostic(std::move(msg), std::move(notes), std::move(help));
         d.location = loc;
-        d.sourceName = sourceName_;
-        result_.diagnostics.push_back(std::move(d));
+        d.sourceName = sourceName;
+        result.diagnostics.push_back(std::move(d));
+    }
+
+    void Error(const SourceLocation &loc, AsmInstructionDiagnostic diagnostic) {
+        Error(loc, std::move(diagnostic.message), std::move(diagnostic.notes), std::move(diagnostic.help));
     }
 
     // Emission primitives
     void Emit8(std::uint8_t b) {
-        out_.push_back(b);
+        out.push_back(b);
     }
 
     void Emit32(std::int32_t v) {
-        const auto u = static_cast<std::uint32_t>(v);
-        out_.push_back(u & 0xFF);
-        out_.push_back((u >> 8) & 0xFF);
-        out_.push_back((u >> 16) & 0xFF);
-        out_.push_back((u >> 24) & 0xFF);
+        Append32(out, v);
     }
 
     void Emit64(std::uint64_t v) {
-        for (int i = 0; i < 8; ++i) {
-            out_.push_back(v & 0xFF);
-            v >>= 8;
-        }
+        Append64(out, v);
     }
 
     std::uint32_t Here() const {
-        return static_cast<std::uint32_t>(out_.size());
-    }
-
-    void CollectLabels() {
-        // Offsets are filled during encoding; here we only reserve the names so
-        // a forward `jmp label` can tell a local label from an extern symbol.
-        for (const auto &instr : instrs_) {
-            if (!instr.labelDef.empty()) {
-                labels_.emplace(instr.labelDef, 0);
-            }
-        }
+        return static_cast<std::uint32_t>(out.size());
     }
 
     // Resolve one operand that names a register into its info, reporting an
     // error if it is not a known register.
-    std::optional<X64RegInfo> Reg(const AsmOperand &op) {
-        X64RegInfo info = LookupX64Reg(op.name);
+    std::optional<AsmRegInfo> Reg(const AsmOperand &op) {
+        AsmRegInfo info = LookupRegister(Target::Arch::X86_64, op.name);
         if (!info.valid) {
-            Error(op.location, std::format("unknown register '{}'", op.name));
+            Error(op.location, ClassifyAsmRegister(op.name, targetOs, Target::Arch::X86_64));
             return std::nullopt;
         }
         return info;
     }
 
     // Build the ModRM/SIB/disp encoding for a register operand (mod = 3).
-    RmEnc EncodeRmReg(const X64RegInfo &r) {
+    RmEnc EncodeRmReg(const AsmRegInfo &r) {
         RmEnc e;
         e.modrm = static_cast<std::uint8_t>(0xC0 | (r.code & 7));
         e.rexB = r.code >= 8;
@@ -169,17 +149,17 @@ private:
         int baseCode = 0;
         int indexCode = 0;
         if (hasBase) {
-            X64RegInfo b = LookupX64Reg(op.memBase);
+            AsmRegInfo b = LookupRegister(Target::Arch::X86_64, op.memBase);
             if (!b.valid || b.size != 8) {
-                Error(op.location, std::format("invalid base register '{}'", op.memBase));
+                Error(op.location, std::format("'{}' is not an x86-64 base register", op.memBase));
             }
             baseCode = b.code;
             e.rexB = b.code >= 8;
         }
         if (hasIndex) {
-            X64RegInfo x = LookupX64Reg(op.memIndex);
+            AsmRegInfo x = LookupRegister(Target::Arch::X86_64, op.memIndex);
             if (!x.valid || x.size != 8) {
-                Error(op.location, std::format("invalid index register '{}'", op.memIndex));
+                Error(op.location, std::format("'{}' is not an x86-64 index register", op.memIndex));
             }
             if (x.code == 4) {
                 Error(op.location, "rsp cannot be used as an index register");
@@ -257,7 +237,7 @@ private:
         return e;
     }
 
-    RmEnc EncodeRm(const AsmOperand &op, std::optional<X64RegInfo> &regOut) {
+    RmEnc EncodeRm(const AsmOperand &op, std::optional<AsmRegInfo> &regOut) {
         if (op.kind == AsmOperand::Kind::Reg) {
             auto r = Reg(op);
             if (!r) {
@@ -322,7 +302,7 @@ private:
             if (!rm.ripSymbol.empty()) {
                 // The linker patches the whole field as targetVA + addend -
                 // (site + 4); fold the in-bracket displacement into the addend.
-                result_.fixups.push_back({fieldOff, rm.ripSymbol, RcuRelType::Rel32, rm.disp});
+                result.fixups.push_back({fieldOff, rm.ripSymbol, RcuRelType::Rel32, rm.disp});
             }
         }
         else if (rm.dispLen == 1) {
@@ -372,7 +352,7 @@ private:
     int OperandSize(const AsmInstr &in, int defaultSize) {
         for (const auto &op : in.operands) {
             if (op.kind == AsmOperand::Kind::Reg) {
-                if (X64RegInfo r = LookupX64Reg(op.name); r.valid) {
+                if (AsmRegInfo r = LookupRegister(Target::Arch::X86_64, op.name); r.valid) {
                     return r.size;
                 }
             }
@@ -385,7 +365,7 @@ private:
         return defaultSize;
     }
 
-    // Encode a signed/zero immediate into `out_` at the appropriate width for an
+    // Encode a signed/zero immediate into `out` at the appropriate width for an
     // ALU immediate (imm8 when it fits, otherwise imm32).
     void EmitAluImm(std::int64_t v, int opSize, bool useImm8) {
         if (opSize == 1 || useImm8) {
@@ -394,14 +374,6 @@ private:
         else {
             Emit32(static_cast<std::int32_t>(v));
         }
-    }
-
-    static bool FitsInt8(std::int64_t v) {
-        return v >= -128 && v <= 127;
-    }
-
-    static bool FitsInt32(std::int64_t v) {
-        return v >= INT32_MIN && v <= INT32_MAX;
     }
 
     // --- ALU family (add/or/adc/sbb/and/sub/xor/cmp/mov) -------------------
@@ -424,11 +396,12 @@ private:
 
         if (src.kind == AsmOperand::Kind::Imm) {
             // group /ext with 0x80 (byte) or 0x81 / 0x83 (imm8 sign-extended).
-            std::optional<X64RegInfo> reg;
+            std::optional<AsmRegInfo> reg;
             RmEnc rm = EncodeRm(dst, reg);
             const bool useImm8 = !byte && FitsInt8(src.imm);
             if (!byte && !useImm8 && !FitsInt32(src.imm)) {
-                Error(src.location, "immediate does not fit in 32 bits");
+                Error(src.location, Signed32EncodingRangeDiagnostic(in.mnemonic, src.imm));
+                return;
             }
             const std::uint8_t opcode = byte ? 0x80 : (useImm8 ? 0x83 : 0x81);
             EmitModRM(opSize, {opcode}, spec.ext, rm, in.location);
@@ -443,7 +416,7 @@ private:
             if (!srcReg) {
                 return;
             }
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(dst, ignore);
             rm.rexRequired = rm.rexRequired || srcReg->rexRequired;
             rm.rexForbidden = rm.rexForbidden || srcReg->high8;
@@ -458,7 +431,7 @@ private:
             if (!dstReg) {
                 return;
             }
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(src, ignore);
             const std::uint8_t opcode = byte ? ((spec.mrOpcode & ~1) | 2) : (spec.mrOpcode | 2);
             EmitModRM(opSize, {opcode}, dstReg->code, rm, in.location);
@@ -505,10 +478,11 @@ private:
         }
 
         if (src.kind == AsmOperand::Kind::Imm && dst.kind == AsmOperand::Kind::Mem) {
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(dst, ignore);
             if (!FitsInt32(src.imm)) {
-                Error(src.location, "immediate does not fit in 32 bits");
+                Error(src.location, Signed32EncodingRangeDiagnostic("mov", src.imm));
+                return;
             }
             EmitModRM(opSize, {static_cast<std::uint8_t>(byte ? 0xC6 : 0xC7)}, 0, rm, in.location);
             EmitAluImm(src.imm, opSize, byte);
@@ -527,7 +501,7 @@ private:
             if (!dstReg) {
                 return;
             }
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(mem, ignore);
             EmitModRM(8, {0x8D}, dstReg->code, rm, in.location);
             return;
@@ -547,7 +521,7 @@ private:
         const int opSize = OperandSize(in, 8);
         const bool byte = opSize == 1;
         if (src.kind == AsmOperand::Kind::Imm) {
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(dst, ignore);
             EmitModRM(opSize, {static_cast<std::uint8_t>(byte ? 0xF6 : 0xF7)}, 0, rm, in.location);
             EmitAluImm(src.imm, opSize, byte);
@@ -558,7 +532,7 @@ private:
             if (!srcReg) {
                 return;
             }
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(dst, ignore);
             EmitModRM(opSize, {static_cast<std::uint8_t>(byte ? 0x84 : 0x85)}, srcReg->code, rm, in.location);
             return;
@@ -576,9 +550,96 @@ private:
         if (!dstReg) {
             return;
         }
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(in.operands[1], ignore);
         EmitModRM(dstReg->size, {0x8D}, dstReg->code, rm, in.location);
+    }
+
+    void EncodeXchg(const AsmInstr &in) {
+        if (in.operands.size() != 2) {
+            Error(in.location, "'xchg' expects 2 operands");
+            return;
+        }
+        const AsmOperand &dst = in.operands[0];
+        const AsmOperand &src = in.operands[1];
+        const int opSize = OperandSize(in, 8);
+        const bool byte = opSize == 1;
+        if (src.kind == AsmOperand::Kind::Reg &&
+            (dst.kind == AsmOperand::Kind::Reg || dst.kind == AsmOperand::Kind::Mem)) {
+            auto srcReg = Reg(src);
+            if (!srcReg) {
+                return;
+            }
+            std::optional<AsmRegInfo> ignore;
+            RmEnc rm = EncodeRm(dst, ignore);
+            rm.rexRequired = rm.rexRequired || srcReg->rexRequired;
+            rm.rexForbidden = rm.rexForbidden || srcReg->high8;
+            EmitModRM(opSize, {static_cast<std::uint8_t>(byte ? 0x86 : 0x87)}, srcReg->code, rm, in.location);
+            return;
+        }
+        if (dst.kind == AsmOperand::Kind::Reg && src.kind == AsmOperand::Kind::Mem) {
+            auto dstReg = Reg(dst);
+            if (!dstReg) {
+                return;
+            }
+            std::optional<AsmRegInfo> ignore;
+            RmEnc rm = EncodeRm(src, ignore);
+            rm.rexRequired = rm.rexRequired || dstReg->rexRequired;
+            rm.rexForbidden = rm.rexForbidden || dstReg->high8;
+            EmitModRM(opSize, {static_cast<std::uint8_t>(byte ? 0x86 : 0x87)}, dstReg->code, rm, in.location);
+            return;
+        }
+        Error(in.location, "unsupported operands for 'xchg'");
+    }
+
+    void EncodeCmpxchg(const AsmInstr &in) {
+        if (in.operands.size() != 2) {
+            Error(in.location, "'cmpxchg' expects 2 operands");
+            return;
+        }
+        const AsmOperand &dst = in.operands[0];
+        const AsmOperand &src = in.operands[1];
+        const int opSize = OperandSize(in, 8);
+        const bool byte = opSize == 1;
+        if (src.kind == AsmOperand::Kind::Reg &&
+            (dst.kind == AsmOperand::Kind::Reg || dst.kind == AsmOperand::Kind::Mem)) {
+            auto srcReg = Reg(src);
+            if (!srcReg) {
+                return;
+            }
+            std::optional<AsmRegInfo> ignore;
+            RmEnc rm = EncodeRm(dst, ignore);
+            rm.rexRequired = rm.rexRequired || srcReg->rexRequired;
+            rm.rexForbidden = rm.rexForbidden || srcReg->high8;
+            EmitModRM(opSize, {0x0F, static_cast<std::uint8_t>(byte ? 0xB0 : 0xB1)}, srcReg->code, rm, in.location);
+            return;
+        }
+        Error(in.location, "unsupported operands for 'cmpxchg'");
+    }
+
+    void EncodeXadd(const AsmInstr &in) {
+        if (in.operands.size() != 2) {
+            Error(in.location, "'xadd' expects 2 operands");
+            return;
+        }
+        const AsmOperand &dst = in.operands[0];
+        const AsmOperand &src = in.operands[1];
+        const int opSize = OperandSize(in, 8);
+        const bool byte = opSize == 1;
+        if (src.kind == AsmOperand::Kind::Reg &&
+            (dst.kind == AsmOperand::Kind::Reg || dst.kind == AsmOperand::Kind::Mem)) {
+            auto srcReg = Reg(src);
+            if (!srcReg) {
+                return;
+            }
+            std::optional<AsmRegInfo> ignore;
+            RmEnc rm = EncodeRm(dst, ignore);
+            rm.rexRequired = rm.rexRequired || srcReg->rexRequired;
+            rm.rexForbidden = rm.rexForbidden || srcReg->high8;
+            EmitModRM(opSize, {0x0F, static_cast<std::uint8_t>(byte ? 0xC0 : 0xC1)}, srcReg->code, rm, in.location);
+            return;
+        }
+        Error(in.location, "unsupported operands for 'xadd'");
     }
 
     // movzx / movsx: reg, r/m of a smaller width.
@@ -594,7 +655,7 @@ private:
         const AsmOperand &src = in.operands[1];
         int srcSize = 0;
         if (src.kind == AsmOperand::Kind::Reg) {
-            X64RegInfo s = LookupX64Reg(src.name);
+            AsmRegInfo s = LookupRegister(Target::Arch::X86_64, src.name);
             srcSize = s.size;
         }
         else if (src.kind == AsmOperand::Kind::Mem) {
@@ -604,7 +665,7 @@ private:
             Error(in.location, std::format("'{}' needs an 8/16/32-bit source (add a size prefix)", in.mnemonic));
             return;
         }
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(src, ignore);
         if (srcSize == 4) {
             // Only movsxd exists (0x63); movzx from 32 is a plain 32-bit mov.
@@ -627,7 +688,7 @@ private:
             return;
         }
         const int opSize = OperandSize(in, 8);
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(in.operands[0], ignore);
         EmitModRM(opSize, {static_cast<std::uint8_t>(opSize == 1 ? 0xF6 : 0xF7)}, ext, rm, in.location);
     }
@@ -639,7 +700,7 @@ private:
             return;
         }
         const int opSize = OperandSize(in, 8);
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(in.operands[0], ignore);
         EmitModRM(opSize, {static_cast<std::uint8_t>(opSize == 1 ? 0xFE : 0xFF)}, ext, rm, in.location);
     }
@@ -666,11 +727,12 @@ private:
             // two-operand shorthand `imul reg, imm`.
             const AsmOperand &src = in.operands.size() == 3 ? in.operands[1] : in.operands[0];
             const std::int64_t imm = in.operands.back().imm;
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(src, ignore);
             const bool imm8 = FitsInt8(imm);
             if (!imm8 && !FitsInt32(imm)) {
-                Error(in.location, "immediate does not fit in 32 bits");
+                Error(in.operands.back().location, Signed32EncodingRangeDiagnostic("imul", imm));
+                return;
             }
             EmitModRM(dstReg->size, {static_cast<std::uint8_t>(imm8 ? 0x6B : 0x69)}, dstReg->code, rm, in.location);
             if (imm8) {
@@ -688,7 +750,7 @@ private:
             if (!dstReg) {
                 return;
             }
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(in.operands[1], ignore);
             EmitModRM(dstReg->size, {0x0F, 0xAF}, dstReg->code, rm, in.location);
             return;
@@ -703,7 +765,7 @@ private:
             return;
         }
         const int opSize = OperandSize(in, 8);
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(in.operands[0], ignore);
         const AsmOperand &count = in.operands[1];
         if (count.kind == AsmOperand::Kind::Reg && count.name == "cl") {
@@ -747,7 +809,7 @@ private:
             return;
         }
         if (op.kind == AsmOperand::Kind::Mem) {
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(op, ignore);
             // push r/m64 -> 0xFF /6 (no REX.W needed for the 64-bit default).
             EmitModRM(4, {0xFF}, 6, rm, in.location);
@@ -774,7 +836,7 @@ private:
             return;
         }
         if (op.kind == AsmOperand::Kind::Mem) {
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(op, ignore);
             EmitModRM(4, {0x8F}, 0, rm, in.location);
             return;
@@ -790,7 +852,7 @@ private:
         }
         const AsmOperand &op = in.operands[0];
         if (op.kind == AsmOperand::Kind::Reg || op.kind == AsmOperand::Kind::Mem) {
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(op, ignore);
             EmitModRM(4, {0xFF}, isCall ? 2 : 4, rm, in.location);
             return;
@@ -818,7 +880,7 @@ private:
             Error(in.location, std::format("'{}' expects 1 operand", in.mnemonic));
             return;
         }
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(in.operands[0], ignore);
         // setcc operates on r/m8.
         EmitModRM(1, {0x0F, ccOpcode}, 0, rm, in.location);
@@ -829,43 +891,21 @@ private:
     void EmitRel32Target(const std::string &name, const SourceLocation &loc) {
         const std::uint32_t fieldOff = Here();
         Emit32(0);
-        if (labels_.contains(name)) {
-            localJumps_.push_back({fieldOff, name, loc});
-        }
-        else {
-            // The linker resolves rel32 as targetVA + addend - (site + 4).
-            result_.fixups.push_back({fieldOff, name, RcuRelType::Rel32, 0});
-        }
-    }
-
-    void ResolveLocalJumps() {
-        for (const auto &j : localJumps_) {
-            const auto it = labels_.find(j.label);
-            if (it == labels_.end()) {
-                Error(j.loc, std::format("undefined label '{}'", j.label));
-                continue;
-            }
-            const auto target = static_cast<std::int32_t>(it->second);
-            const std::int32_t rel = target - static_cast<std::int32_t>(j.fieldOff + 4);
-            out_[j.fieldOff] = rel & 0xFF;
-            out_[j.fieldOff + 1] = (rel >> 8) & 0xFF;
-            out_[j.fieldOff + 2] = (rel >> 16) & 0xFF;
-            out_[j.fieldOff + 3] = (rel >> 24) & 0xFF;
-        }
+        labelFixups.RecordRel32(name, loc, fieldOff);
     }
 
     // --- SSE / SSE2 -------------------------------------------------------
     static bool IsXmmOperand(const AsmOperand &op) {
-        return op.kind == AsmOperand::Kind::Reg && LookupX64Reg(op.name).isXmm;
+        return op.kind == AsmOperand::Kind::Reg && LookupRegister(Target::Arch::X86_64, op.name).IsVector();
     }
 
     // Resolve an operand that must name an XMM register.
-    std::optional<X64RegInfo> Xmm(const AsmOperand &op) {
+    std::optional<AsmRegInfo> Xmm(const AsmOperand &op) {
         if (!IsXmmOperand(op)) {
             Error(op.location, "expected an xmm register");
             return std::nullopt;
         }
-        return LookupX64Reg(op.name);
+        return LookupRegister(Target::Arch::X86_64, op.name);
     }
 
     // Two-operand SSE op with the shape `xmm, xmm/mem` (dst in the reg field,
@@ -884,7 +924,7 @@ private:
             Error(src.location, std::format("'{}' source must be an xmm register or memory", in.mnemonic));
             return;
         }
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(src, ignore);
         EmitSse(prefix, {0x0F, opcode}, dst->code, rm, false, in.location);
     }
@@ -904,14 +944,14 @@ private:
                 return;
             }
             auto d = Xmm(dst);
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(src, ignore);
             EmitSse(prefix, {0x0F, loadOp}, d->code, rm, false, in.location);
             return;
         }
         if (dst.kind == AsmOperand::Kind::Mem && IsXmmOperand(src)) {
             auto s = Xmm(src);
-            std::optional<X64RegInfo> ignore;
+            std::optional<AsmRegInfo> ignore;
             RmEnc rm = EncodeRm(dst, ignore);
             EmitSse(prefix, {0x0F, storeOp}, s->code, rm, false, in.location);
             return;
@@ -928,7 +968,7 @@ private:
         }
         const AsmOperand &dst = in.operands[0];
         const AsmOperand &src = in.operands[1];
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
 
         // Pure SSE data moves (no GP register), movq only: xmm <- xmm/m64 uses
         // F3 0F 7E; m64 <- xmm uses 66 0F D6.
@@ -977,8 +1017,8 @@ private:
         const AsmOperand &src = in.operands[1];
         int srcSize = 4;
         if (src.kind == AsmOperand::Kind::Reg) {
-            X64RegInfo r = LookupX64Reg(src.name);
-            if (!r.valid || r.isXmm || (r.size != 4 && r.size != 8)) {
+            AsmRegInfo r = LookupRegister(Target::Arch::X86_64, src.name);
+            if (!r.valid || r.IsVector() || (r.size != 4 && r.size != 8)) {
                 Error(src.location, std::format("'{}' source must be a 32- or 64-bit gpr or memory", in.mnemonic));
                 return;
             }
@@ -991,7 +1031,7 @@ private:
             Error(src.location, std::format("'{}' source must be a gpr or memory", in.mnemonic));
             return;
         }
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(src, ignore);
         EmitSse(prefix, {0x0F, 0x2A}, dst->code, rm, srcSize == 8, in.location);
     }
@@ -1003,8 +1043,8 @@ private:
             Error(in.location, std::format("'{}' expects: {} gpr, xmm/mem", in.mnemonic, in.mnemonic));
             return;
         }
-        X64RegInfo d = LookupX64Reg(in.operands[0].name);
-        if (!d.valid || d.isXmm || (d.size != 4 && d.size != 8)) {
+        AsmRegInfo d = LookupRegister(Target::Arch::X86_64, in.operands[0].name);
+        if (!d.valid || d.IsVector() || (d.size != 4 && d.size != 8)) {
             Error(in.operands[0].location, std::format("'{}' destination must be a 32- or 64-bit gpr", in.mnemonic));
             return;
         }
@@ -1013,12 +1053,17 @@ private:
             Error(src.location, std::format("'{}' source must be an xmm register or memory", in.mnemonic));
             return;
         }
-        std::optional<X64RegInfo> ignore;
+        std::optional<AsmRegInfo> ignore;
         RmEnc rm = EncodeRm(src, ignore);
         EmitSse(prefix, {0x0F, opcode}, d.code, rm, d.size == 8, in.location);
     }
 
     void EncodeInstr(const AsmInstr &in) {
+        if (in.arch != Target::Arch::Unknown && in.arch != Target::Arch::X86_64) {
+            Error(in.location,
+                  ParsedAssemblyArchitectureDiagnostic(in.mnemonic, in.arch, targetOs, Target::Arch::X86_64));
+            return;
+        }
         const std::string &m = in.mnemonic;
 
         // Zero-operand and fixed encodings first.
@@ -1051,6 +1096,45 @@ private:
             else {
                 Error(in.location, "'int' expects an immediate");
             }
+            return;
+        }
+        if (m == "pause") {
+            Emit8(0xF3);
+            Emit8(0x90);
+            return;
+        }
+        if (m == "mfence") {
+            Emit8(0x0F);
+            Emit8(0xAE);
+            Emit8(0xF0);
+            return;
+        }
+        if (m == "lfence") {
+            Emit8(0x0F);
+            Emit8(0xAE);
+            Emit8(0xE8);
+            return;
+        }
+        if (m == "sfence") {
+            Emit8(0x0F);
+            Emit8(0xAE);
+            Emit8(0xF8);
+            return;
+        }
+        if (m == "lock") {
+            Emit8(0xF0);
+            return;
+        }
+        if (m == "xchg") {
+            EncodeXchg(in);
+            return;
+        }
+        if (m == "cmpxchg") {
+            EncodeCmpxchg(in);
+            return;
+        }
+        if (m == "xadd") {
+            EncodeXadd(in);
             return;
         }
         if (m == "cqo") {
@@ -1180,44 +1264,14 @@ private:
             return;
         }
 
-        // SSE/SSE2. Two-operand `xmm, xmm/mem` ops keyed by (prefix, opcode);
-        // prefix 0 = none, 0x66/0xF2/0xF3 = the mandatory prefix.
-        struct SseOp {
-            std::uint8_t prefix;
-            std::uint8_t opcode;
-        };
-
-        static const std::unordered_map<std::string_view, SseOp> sse = {
-            {"sqrtsd", {0xF2, 0x51}},   {"sqrtss", {0xF3, 0x51}},  {"addsd", {0xF2, 0x58}},
-            {"addss", {0xF3, 0x58}},    {"subsd", {0xF2, 0x5C}},   {"subss", {0xF3, 0x5C}},
-            {"mulsd", {0xF2, 0x59}},    {"mulss", {0xF3, 0x59}},   {"divsd", {0xF2, 0x5E}},
-            {"divss", {0xF3, 0x5E}},    {"minsd", {0xF2, 0x5D}},   {"minss", {0xF3, 0x5D}},
-            {"maxsd", {0xF2, 0x5F}},    {"maxss", {0xF3, 0x5F}},   {"cvtsd2ss", {0xF2, 0x5A}},
-            {"cvtss2sd", {0xF3, 0x5A}}, {"ucomisd", {0x66, 0x2E}}, {"ucomiss", {0x00, 0x2E}},
-            {"comisd", {0x66, 0x2F}},   {"comiss", {0x00, 0x2F}},  {"xorps", {0x00, 0x57}},
-            {"xorpd", {0x66, 0x57}},    {"andps", {0x00, 0x54}},   {"andpd", {0x66, 0x54}},
-            {"orps", {0x00, 0x56}},     {"orpd", {0x66, 0x56}},    {"andnps", {0x00, 0x55}},
-            {"andnpd", {0x66, 0x55}},   {"pxor", {0x66, 0xEF}},    {"pand", {0x66, 0xDB}},
-            {"por", {0x66, 0xEB}},
-        };
-        if (const auto it = sse.find(m); it != sse.end()) {
-            EncodeSseRegRm(in, it->second.prefix, it->second.opcode);
-            return;
-        }
-
-        // SSE data moves: (prefix, load opcode, store opcode).
-        struct SseMovOp {
-            std::uint8_t prefix;
-            std::uint8_t loadOp;
-            std::uint8_t storeOp;
-        };
-
-        static const std::unordered_map<std::string_view, SseMovOp> ssemov = {
-            {"movsd", {0xF2, 0x10, 0x11}},  {"movss", {0xF3, 0x10, 0x11}},  {"movups", {0x00, 0x10, 0x11}},
-            {"movupd", {0x66, 0x10, 0x11}}, {"movaps", {0x00, 0x28, 0x29}}, {"movapd", {0x66, 0x28, 0x29}},
-        };
-        if (const auto it = ssemov.find(m); it != ssemov.end()) {
-            EncodeSseMove(in, it->second.prefix, it->second.loadOp, it->second.storeOp);
+        // SSE/SSE2 r/m forms are decoded in the private support implementation.
+        if (const auto *form = LookupSseForm(m)) {
+            if (form->kind == SseFormKind::RegRm) {
+                EncodeSseRegRm(in, form->prefix, form->loadOpcode);
+            }
+            else {
+                EncodeSseMove(in, form->prefix, form->loadOpcode, form->storeOpcode);
+            }
             return;
         }
 
@@ -1254,32 +1308,14 @@ private:
             return;
         }
 
-        Error(in.location, std::format("unsupported instruction '{}'", m));
-    }
-
-    // Map a jCC/setCC mnemonic (given the "j" or "set" prefix) to the low nibble
-    // of its condition-code opcode.
-    static std::optional<int> ConditionCode(const std::string &m, std::string_view prefix) {
-        if (m.size() <= prefix.size() || std::string_view(m).substr(0, prefix.size()) != prefix) {
-            return std::nullopt;
-        }
-        const std::string_view cc = std::string_view(m).substr(prefix.size());
-        static const std::unordered_map<std::string_view, int> table = {
-            {"o", 0x0},  {"no", 0x1}, {"b", 0x2},  {"c", 0x2},  {"nae", 0x2}, {"ae", 0x3},  {"nb", 0x3}, {"nc", 0x3},
-            {"e", 0x4},  {"z", 0x4},  {"ne", 0x5}, {"nz", 0x5}, {"be", 0x6},  {"na", 0x6},  {"a", 0x7},  {"nbe", 0x7},
-            {"s", 0x8},  {"ns", 0x9}, {"p", 0xA},  {"pe", 0xA}, {"np", 0xB},  {"po", 0xB},  {"l", 0xC},  {"nge", 0xC},
-            {"ge", 0xD}, {"nl", 0xD}, {"le", 0xE}, {"ng", 0xE}, {"g", 0xF},   {"nle", 0xF},
-        };
-        if (const auto it = table.find(cc); it != table.end()) {
-            return it->second;
-        }
-        return std::nullopt;
+        Error(in.location, ClassifyAsmInstruction(m, targetOs, Target::Arch::X86_64));
     }
 };
 } // namespace
 
-AsmAssembly AssembleAsmFunc(const std::vector<AsmInstr> &instrs, const std::string &sourceName, Bytes &out) {
-    Assembler asmr(instrs, sourceName, out);
+AsmAssembly AssembleAsmFunc(const std::vector<AsmInstr> &instrs, const std::string &sourceName, Bytes &out,
+                            const Target::OS targetOs) {
+    Assembler asmr(instrs, sourceName, out, targetOs);
     return asmr.Run();
 }
 } // namespace Rux

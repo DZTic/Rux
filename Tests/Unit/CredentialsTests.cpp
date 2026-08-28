@@ -1,0 +1,274 @@
+#include "Driver/Credentials.h"
+#include "System/Os.h"
+#include "Target/Target.h"
+
+#include <doctest.h>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string>
+
+using namespace Rux::Driver;
+using namespace Rux::System;
+using namespace Rux::Target;
+
+namespace {
+/// The variable UserDataDir derives the per-user root from on this host.
+constexpr const char *homeVariable = (HostOS == OS::Windows) ? "LOCALAPPDATA" : "HOME";
+
+/**
+ * @brief Point the per-user directory at a private temporary tree.
+ *
+ * Every case here writes a credentials file, so without this they would
+ * overwrite the credentials of whoever is running the tests. The previous
+ * directory and RUX_TOKEN are both restored on the way out.
+ */
+class ScopedUserDataDir {
+public:
+    ScopedUserDataDir() {
+        static int sequence = 0;
+        savedHome = GetEnvPath(homeVariable);
+        savedToken = GetEnv(kCredentialVariable);
+        savedRegistry = GetEnv(kRegistryVariable);
+
+        root = TempDirectory() / ("RuxCredentialsTest-" + std::to_string(++sequence));
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+        REQUIRE(!ec);
+        REQUIRE(SetEnvPath(homeVariable, root));
+        REQUIRE(UnsetEnv(kCredentialVariable));
+        // A redirect that silently failed would send the writes below at the
+        // real credentials file, so prove the path moved before any test runs.
+        REQUIRE(CredentialsPath().string().starts_with(root.string()));
+    }
+
+    ScopedUserDataDir(const ScopedUserDataDir &) = delete;
+    ScopedUserDataDir &operator=(const ScopedUserDataDir &) = delete;
+
+    ~ScopedUserDataDir() {
+        if (savedHome) {
+            static_cast<void>(SetEnvPath(homeVariable, *savedHome));
+        }
+        else {
+            static_cast<void>(UnsetEnv(homeVariable));
+        }
+        if (savedToken) {
+            static_cast<void>(SetEnv(kCredentialVariable, *savedToken));
+        }
+        else {
+            static_cast<void>(UnsetEnv(kCredentialVariable));
+        }
+        if (savedRegistry) {
+            static_cast<void>(SetEnv(kRegistryVariable, *savedRegistry));
+        }
+        else {
+            static_cast<void>(UnsetEnv(kRegistryVariable));
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+
+private:
+    std::optional<std::filesystem::path> savedHome;
+    std::optional<std::string> savedToken;
+    std::optional<std::string> savedRegistry;
+    std::filesystem::path root;
+};
+
+constexpr const char *official = "https://api.rux-lang.dev";
+constexpr const char *local = "http://localhost:8080";
+
+std::optional<Credential> Loaded(const std::string_view registry) {
+    auto result = LoadCredential(registry);
+    REQUIRE(result.has_value());
+    return *result;
+}
+
+std::optional<Credential> Resolved(const std::string_view registry) {
+    auto result = ResolveCredential(registry);
+    REQUIRE(result.has_value());
+    return *result;
+}
+} // namespace
+
+TEST_CASE("a stored credential is read back with the file as its source") {
+    const ScopedUserDataDir sandbox;
+
+    CHECK_FALSE(Loaded(official).has_value());
+    REQUIRE(StoreCredential(official, "rux_pat_one").has_value());
+
+    const auto loaded = Loaded(official);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->token == "rux_pat_one");
+    CHECK(loaded->source == CredentialsPath().generic_string());
+}
+
+TEST_CASE("each registry keeps its own token") {
+    const ScopedUserDataDir sandbox;
+
+    REQUIRE(StoreCredential(official, "official-token").has_value());
+    REQUIRE(StoreCredential(local, "local-token").has_value());
+    REQUIRE(Loaded(official).has_value());
+    REQUIRE(Loaded(local).has_value());
+    CHECK(Loaded(official)->token == "official-token");
+    CHECK(Loaded(local)->token == "local-token");
+
+    // Replacing one entry must leave every other registry's alone: this is what
+    // stops a local test registry from being handed the official credential.
+    REQUIRE(StoreCredential(local, "local-token-2").has_value());
+    CHECK(Loaded(official)->token == "official-token");
+    CHECK(Loaded(local)->token == "local-token-2");
+    CHECK_FALSE(Loaded("https://registry.example").has_value());
+}
+
+TEST_CASE("trailing slashes name the same registry") {
+    const ScopedUserDataDir sandbox;
+
+    CHECK(NormalizeRegistryBase("https://api.rux-lang.dev///") == official);
+    CHECK(NormalizeRegistryBase("  https://api.rux-lang.dev/  ") == official);
+
+    REQUIRE(StoreCredential("https://api.rux-lang.dev/", "token").has_value());
+    REQUIRE(Loaded(official).has_value());
+    CHECK(Loaded(official)->token == "token");
+
+    // The slashed and unslashed forms address one entry, not two.
+    REQUIRE(StoreCredential(official, "replacement").has_value());
+    REQUIRE(Loaded("https://api.rux-lang.dev/").has_value());
+    CHECK(Loaded("https://api.rux-lang.dev/")->token == "replacement");
+    const auto erased = EraseCredential("https://api.rux-lang.dev//");
+    REQUIRE(erased.has_value());
+    CHECK(*erased);
+    CHECK_FALSE(Loaded(official).has_value());
+}
+
+TEST_CASE("RUX_TOKEN outranks the stored token") {
+    const ScopedUserDataDir sandbox;
+
+    REQUIRE(StoreCredential(official, "stored-token").has_value());
+    REQUIRE(SetEnv(kCredentialVariable, "env-token"));
+
+    const auto resolved = Resolved(official);
+    REQUIRE(resolved.has_value());
+    CHECK(resolved->token == "env-token");
+    CHECK(resolved->source == kCredentialVariable);
+
+    // The environment only shadows the file; it does not replace it.
+    REQUIRE(Loaded(official).has_value());
+    CHECK(Loaded(official)->token == "stored-token");
+
+    // An unset variable falls through to the stored token, and so does an empty
+    // one -- an exported-but-blank RUX_TOKEN must not lock publishing out.
+    REQUIRE(SetEnv(kCredentialVariable, ""));
+    REQUIRE(Resolved(official).has_value());
+    CHECK(Resolved(official)->token == "stored-token");
+
+    REQUIRE(UnsetEnv(kCredentialVariable));
+    REQUIRE(Resolved(official).has_value());
+    CHECK(Resolved(official)->token == "stored-token");
+    CHECK(Resolved(official)->source == CredentialsPath().generic_string());
+    CHECK_FALSE(Resolved(local).has_value());
+}
+
+TEST_CASE("erasing removes one registry and reports whether it was there") {
+    const ScopedUserDataDir sandbox;
+
+    REQUIRE(StoreCredential(official, "official-token").has_value());
+    REQUIRE(StoreCredential(local, "local-token").has_value());
+
+    const auto first = EraseCredential(official);
+    REQUIRE(first.has_value());
+    CHECK(*first);
+    CHECK_FALSE(Loaded(official).has_value());
+    CHECK(Loaded(local).has_value());
+
+    // Logging out twice is not an error, it just has nothing left to do.
+    const auto again = EraseCredential(official);
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again);
+
+    // Removing the last entry leaves no file behind.
+    REQUIRE(EraseCredential(local).has_value());
+    CHECK_FALSE(std::filesystem::exists(CredentialsPath()));
+}
+
+TEST_CASE("a missing credentials file is empty and a malformed file reports its path") {
+    const ScopedUserDataDir sandbox;
+
+    CHECK_FALSE(Loaded(official).has_value());
+
+    std::error_code ec;
+    std::filesystem::create_directories(CredentialsPath().parent_path(), ec);
+    {
+        std::ofstream file(CredentialsPath(), std::ios::binary);
+        REQUIRE(file.is_open());
+        file << "this is not a credentials file\n"
+             << "[Registry.\n"
+             << "Token = unquoted\n"
+             << "[Registry.\"https://api.rux-lang.dev\"]\n"
+             << "Nonsense\n";
+    }
+    const auto malformed = LoadCredential(official);
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK(malformed.error().contains("could not parse credentials file"));
+    CHECK(malformed.error().contains(CredentialsPath().generic_string()));
+
+    CHECK_FALSE(StoreCredential(official, "fresh").has_value());
+}
+
+TEST_CASE("the credentials file is restricted to its owner") {
+    const ScopedUserDataDir sandbox;
+
+    REQUIRE(StoreCredential(official, "secret").has_value());
+    REQUIRE(std::filesystem::exists(CredentialsPath()));
+
+    if constexpr (HostOS != OS::Windows) {
+        using std::filesystem::perms;
+        const perms mode = std::filesystem::status(CredentialsPath()).permissions();
+        CHECK((mode & perms::group_all) == perms::none);
+        CHECK((mode & perms::others_all) == perms::none);
+    }
+
+    // No temporary is left beside the real file once the write completes.
+    std::filesystem::path temp = CredentialsPath();
+    temp += ".tmp";
+    CHECK_FALSE(std::filesystem::exists(temp));
+}
+
+TEST_CASE("the registry base falls back from the flag to the environment") {
+    const ScopedUserDataDir sandbox;
+
+    REQUIRE(UnsetEnv(kRegistryVariable));
+    CHECK(ResolveRegistryBase("") == official);
+    CHECK(ResolveRegistryBase("http://localhost:8080/") == local);
+
+    REQUIRE(SetEnv(kRegistryVariable, "http://localhost:8080/"));
+    CHECK(ResolveRegistryBase("") == local);
+    // An explicit --registry still wins over the environment.
+    CHECK(ResolveRegistryBase("https://api.rux-lang.dev/") == official);
+
+    REQUIRE(UnsetEnv(kRegistryVariable));
+    CHECK(ResolveRegistryBase("") == official);
+}
+
+TEST_CASE("credential verification responses remain structured and never carry the token") {
+    const auto accepted =
+        DecodeCredentialVerification(200, R"({"data":{"github_login":"octocat","scopes":["read","publish"]}})");
+    CHECK(accepted.kind == CredentialVerificationKind::Accepted);
+    CHECK(accepted.identity == "octocat");
+
+    const auto missing = DecodeCredentialVerification(200, R"({"data":{"github_login":"octocat","scopes":["read"]}})");
+    CHECK(missing.kind == CredentialVerificationKind::MissingPublishScope);
+    CHECK(missing.identity == "octocat");
+
+    const auto rejected = DecodeCredentialVerification(401, R"({"detail":"reflected-token"})");
+    CHECK(rejected.kind == CredentialVerificationKind::Rejected);
+    CHECK(rejected.detail.empty());
+    CHECK(DecodeCredentialVerification(403, R"({"code":"insufficient_scope"})").kind ==
+          CredentialVerificationKind::MissingPublishScope);
+
+    CHECK(DecodeCredentialVerification(404, "").kind == CredentialVerificationKind::Unsupported);
+    CHECK(DecodeCredentialVerification(200, "not json").kind == CredentialVerificationKind::Malformed);
+    CHECK(DecodeCredentialVerification(200, R"({"data":{}})").kind == CredentialVerificationKind::Malformed);
+    CHECK(DecodeCredentialVerification(500, "").kind == CredentialVerificationKind::Rejected);
+}

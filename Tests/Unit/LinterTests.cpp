@@ -1,6 +1,8 @@
 #include "Linter/Linter.h"
 
 #include <doctest.h>
+#include <string>
+#include <vector>
 
 using namespace Rux;
 
@@ -49,16 +51,31 @@ TEST_CASE("linter warns on bad function name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "function name 'bad_name' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadName'");
 }
 
 TEST_CASE("linter accepts symbolic operator function names") {
     auto result = Rux::Linting::Lint(R"(
         extend Number {
-            func +(self, other: Number) -> Number;
-            func ==(self, other: Number) -> bool;
+            func +(self: &Self, other: Number) -> Number;
+            func ==(self: &Self, other: Number) -> bool;
         }
     )",
                                      "operators.rux");
+    CHECK_FALSE(result.HasErrors());
+    CHECK(result.diagnostics.empty());
+}
+
+TEST_CASE("linter accepts lifecycle operation names") {
+    auto result = Rux::Linting::Lint(R"(
+        struct Cell { value: int32; }
+        extend Cell {
+            func =(self: &var Cell, other: &Cell);
+            func <-(self: &var Cell, other: Cell) {}
+            func ~Cell(self: &var Cell) {}
+        }
+    )",
+                                     "lifecycle.rux");
     CHECK_FALSE(result.HasErrors());
     CHECK(result.diagnostics.empty());
 }
@@ -68,6 +85,7 @@ TEST_CASE("linter warns on bad function parameter name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "parameter name 'BadParam' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badParam'");
 }
 
 TEST_CASE("linter warns on bad struct name") {
@@ -75,6 +93,7 @@ TEST_CASE("linter warns on bad struct name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "struct name 'badStruct' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadStruct'");
 }
 
 TEST_CASE("linter warns on bad struct field name") {
@@ -82,6 +101,7 @@ TEST_CASE("linter warns on bad struct field name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "struct field name 'BadField' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badField'");
 }
 
 TEST_CASE("linter warns on bad enum name") {
@@ -89,6 +109,7 @@ TEST_CASE("linter warns on bad enum name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "enum name 'badEnum' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadEnum'");
 }
 
 TEST_CASE("linter warns on bad enum variant name") {
@@ -96,6 +117,7 @@ TEST_CASE("linter warns on bad enum variant name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "enum variant name 'badVariant' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadVariant'");
 }
 
 TEST_CASE("linter warns on bad enum variant field name") {
@@ -103,6 +125,7 @@ TEST_CASE("linter warns on bad enum variant field name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "enum variant field name 'BadField' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badField'");
 }
 
 TEST_CASE("linter warns on bad union name") {
@@ -110,6 +133,7 @@ TEST_CASE("linter warns on bad union name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "union name 'badUnion' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadUnion'");
 }
 
 TEST_CASE("linter warns on bad union field name") {
@@ -117,6 +141,7 @@ TEST_CASE("linter warns on bad union field name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "union field name 'BadField' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badField'");
 }
 
 TEST_CASE("linter warns on bad interface name") {
@@ -124,6 +149,7 @@ TEST_CASE("linter warns on bad interface name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "interface name 'badInterface' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadInterface'");
 }
 
 TEST_CASE("linter warns on bad module name") {
@@ -131,6 +157,7 @@ TEST_CASE("linter warns on bad module name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "module name 'bad_module' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadModule'");
 }
 
 TEST_CASE("linter warns on bad constant name") {
@@ -138,6 +165,7 @@ TEST_CASE("linter warns on bad constant name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "constant name 'badConst' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadConst'");
 }
 
 TEST_CASE("linter warns on bad type alias name") {
@@ -145,6 +173,7 @@ TEST_CASE("linter warns on bad type alias name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "type alias name 'badAlias' should be PascalCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'BadAlias'");
 }
 
 TEST_CASE("naming.type allows foreign type and member names") {
@@ -156,6 +185,11 @@ TEST_CASE("naming.type allows foreign type and member names") {
         struct timespec {
             tv_sec: time_t;
             tv_nsec: int64;
+        }
+
+        #Allow("naming.type")
+        enum OperatingSystem {
+            macOS
         }
     )",
                                      "foreign_types.rux");
@@ -179,11 +213,40 @@ TEST_CASE("naming.type rejects unknown rules and non-type declarations") {
     CHECK(nonType.HasErrors());
 }
 
+TEST_CASE("naming.const allows a constant to keep the spelling its platform published") {
+    // A binding's constant is a C macro's own name -- SEEK_SET, O_RDONLY, FILE_ATTRIBUTE_NORMAL -- which no reader
+    // porting code would recognize renamed, and which the naming rules already carve out for raw declarations.
+    auto allowed = Rux::Linting::Lint(R"(
+        #Allow("naming.const")
+        const SEEK_SET: int32 = 0;
+
+        #Allow("naming.const")
+        const EXIT_FAILURE: int32 = 1;
+    )",
+                                      "foreign_constants.rux");
+    CHECK_FALSE(allowed.HasErrors());
+    CHECK(allowed.diagnostics.empty());
+
+    auto warned = Rux::Linting::Lint("const SEEK_SET: int32 = 0;", "plain_constant.rux");
+    REQUIRE(warned.diagnostics.size() == 1);
+    CHECK(warned.diagnostics[0].message == "constant name 'SEEK_SET' should be PascalCase");
+}
+
+TEST_CASE("naming.const rejects a declaration that is not a constant") {
+    auto nonConst = Rux::Linting::Lint(R"(
+        #Allow("naming.const")
+        type time_t = int64;
+    )",
+                                       "invalid_const_allow.rux");
+    CHECK(nonConst.HasErrors());
+}
+
 TEST_CASE("linter warns on bad local variable name") {
     auto result = Rux::Linting::Lint("func Test() { let BadVar = 10; }", "local_bad.rux");
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
-    CHECK(result.diagnostics[0].message == "variable name 'BadVar' should be camelCase");
+    CHECK(result.diagnostics[0].message == "local variable name 'BadVar' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badVar'");
 }
 
 TEST_CASE("linter warns on bad loop variable name") {
@@ -191,11 +254,232 @@ TEST_CASE("linter warns on bad loop variable name") {
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
     CHECK(result.diagnostics[0].message == "loop variable name 'BadVar' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badVar'");
 }
 
 TEST_CASE("linter warns on bad pattern binding name") {
     auto result = Rux::Linting::Lint("func Test() { let (x, BadVar) = (1, 2); }", "pattern_bad.rux");
     REQUIRE(result.diagnostics.size() == 1);
     CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
-    CHECK(result.diagnostics[0].message == "variable binding 'BadVar' should be camelCase");
+    CHECK(result.diagnostics[0].message == "pattern binding name 'BadVar' should be camelCase");
+    CHECK(result.diagnostics[0].help == "rename it to 'badVar'");
+}
+
+TEST_CASE("linter normalizes acronyms digits and leading underscores") {
+    auto result = Rux::Linting::Lint("func _HTTP_2_handler(HTTP_2_VALUE: int) {}", "normalization.rux");
+    REQUIRE(result.diagnostics.size() == 2);
+    CHECK(result.diagnostics[0].help == "rename it to 'Http2Handler'");
+    CHECK(result.diagnostics[1].help == "rename it to 'http2Value'");
+}
+
+TEST_CASE("linter accepts valid names containing acronyms and digits") {
+    auto result = Rux::Linting::Lint("func HTTP2Server(http2Value: int) {}", "acronyms.rux");
+    CHECK_FALSE(result.HasErrors());
+    CHECK(result.diagnostics.empty());
+}
+
+TEST_CASE("linter omits naming help when the normalized name collides") {
+    auto declarations = Rux::Linting::Lint(R"(
+        func bad_name() {}
+        func BadName() {}
+    )",
+                                           "declaration_collision.rux");
+    REQUIRE(declarations.diagnostics.size() == 1);
+    CHECK_FALSE(declarations.diagnostics[0].help.has_value());
+
+    auto members = Rux::Linting::Lint(R"(
+        struct Example {
+            BadField: int;
+            badField: int;
+        }
+    )",
+                                      "member_collision.rux");
+    REQUIRE(members.diagnostics.size() == 1);
+    CHECK_FALSE(members.diagnostics[0].help.has_value());
+
+    auto locals = Rux::Linting::Lint("func Example(badVar: int) { let BadVar = 1; }", "local_collision.rux");
+    REQUIRE(locals.diagnostics.size() == 1);
+    CHECK_FALSE(locals.diagnostics[0].help.has_value());
+}
+
+TEST_CASE("linter preserves source locations and warning counts for naming diagnostics") {
+    auto result = Rux::Linting::Lint("func bad_name(BadParam: int) {}", "warning_count.rux");
+    REQUIRE(result.diagnostics.size() == 2);
+    CHECK(result.diagnostics[0].severity == Diagnostic::Severity::Warning);
+    CHECK(result.diagnostics[0].location.line == 1);
+    CHECK(result.diagnostics[0].location.column == 1);
+    CHECK(result.diagnostics[1].severity == Diagnostic::Severity::Warning);
+    CHECK(result.diagnostics[1].location.line == 1);
+    CHECK(result.diagnostics[1].location.column == 15);
+}
+
+namespace {
+/// The messages one lint run produced, which is what every documentation case below asserts against.
+std::vector<std::string> Messages(const Rux::Linting::LintResult &result) {
+    std::vector<std::string> messages;
+    messages.reserve(result.diagnostics.size());
+    for (const Diagnostic &diagnostic : result.diagnostics) {
+        messages.push_back(diagnostic.message);
+    }
+    return messages;
+}
+} // namespace
+
+TEST_CASE("a public declaration without documentation is reported") {
+    const std::string source = R"(
+pub struct Handle {
+    value: int32;
+}
+
+pub func Open() -> int32 {
+    return 0i32;
+}
+
+pub const Limit = 8;
+
+pub interface Reader {
+    func Read() -> int32;
+}
+
+pub type Count = int32;
+)";
+
+    const auto messages = Messages(Rux::Linting::Lint(source, "docs.rux"));
+    REQUIRE_EQ(messages.size(), 5);
+    CHECK_EQ(messages[0], "public struct 'Handle' has no documentation comment");
+    CHECK_EQ(messages[1], "public function 'Open' has no documentation comment");
+    CHECK_EQ(messages[2], "public constant 'Limit' has no documentation comment");
+    CHECK_EQ(messages[3], "public interface 'Reader' has no documentation comment");
+    CHECK_EQ(messages[4], "public type alias 'Count' has no documentation comment");
+}
+
+TEST_CASE("a declaration that is not published owes no documentation") {
+    const std::string source = R"(
+struct Handle {
+    value: int32;
+}
+
+func Open() -> int32 {
+    return 0i32;
+}
+)";
+
+    CHECK(Messages(Rux::Linting::Lint(source, "docs.rux")).empty());
+}
+
+TEST_CASE("pub below a private module owes no public API documentation") {
+    const std::string source = R"(
+module Internal {
+    pub struct Detail {}
+    pub func Helper() {}
+}
+)";
+
+    CHECK(Messages(Rux::Linting::Lint(source, "private-module-docs.rux")).empty());
+}
+
+TEST_CASE("pub below a public module is linted as effective public API") {
+    const std::string source = R"(
+pub module Api::Nested {
+    pub func Open() {}
+}
+)";
+
+    const auto messages = Messages(Rux::Linting::Lint(source, "public-module-docs.rux"));
+    REQUIRE_EQ(messages.size(), 1);
+    CHECK_EQ(messages[0], "public function 'Open' has no documentation comment");
+}
+
+TEST_CASE("documentation without an API page is reported") {
+    const std::string source = R"(
+/// Opens the handle.
+pub func Open() -> int32 {
+    return 0i32;
+}
+)";
+
+    const auto messages = Messages(Rux::Linting::Lint(source, "docs.rux"));
+    REQUIRE_EQ(messages.size(), 1);
+    CHECK_EQ(messages[0], "documentation for public function 'Open' names no API page");
+}
+
+TEST_CASE("documentation naming its API page is accepted") {
+    const std::string source = R"(
+/// Opens the handle.
+///
+/// https://rux-lang.dev/docs/api/filesystem/open
+pub func Open() -> int32 {
+    return 0i32;
+}
+)";
+
+    CHECK(Messages(Rux::Linting::Lint(source, "docs.rux")).empty());
+}
+
+TEST_CASE("an undocumented public declaration can allow the rule deliberately") {
+    const std::string source = R"(
+#Allow("docs.missing")
+pub func Open() -> int32 {
+    return 0i32;
+}
+
+/// Closes the handle.
+#Allow("docs.api-url")
+pub func Close() -> int32 {
+    return 0i32;
+}
+)";
+
+    CHECK(Messages(Rux::Linting::Lint(source, "docs.rux")).empty());
+}
+
+TEST_CASE("a comment line wider than the limit is reported once, with its width") {
+    // 121 columns of comment: one past the limit, which is the boundary worth pinning.
+    const std::string wide = "// " + std::string(118, 'x') + "\nfunc Main() -> int { return 0; }\n";
+
+    const auto messages = Messages(Rux::Linting::Lint(wide, "width.rux"));
+    REQUIRE_EQ(messages.size(), 1);
+    CHECK_EQ(messages[0], "comment line is 121 columns wide, over the limit of 120");
+
+    const std::string exact = "// " + std::string(117, 'x') + "\nfunc Main() -> int { return 0; }\n";
+    CHECK(Messages(Rux::Linting::Lint(exact, "width.rux")).empty());
+}
+
+TEST_CASE("comment width is counted in columns rather than bytes") {
+    // Each character is two bytes, so a byte count would report 240 for a line that reads as 120 columns.
+    const std::string source = "// " + [] {
+        std::string text;
+        for (int index = 0; index < 117; ++index) {
+            text += "é";
+        }
+        return text;
+    }() + "\nfunc Main() -> int { return 0; }\n";
+
+    CHECK(Messages(Rux::Linting::Lint(source, "width.rux")).empty());
+}
+
+TEST_CASE("a wide line inside a block comment is reported too") {
+    const std::string source = "/*\n" + std::string(121, 'x') + "\n*/\nfunc Main() -> int { return 0; }\n";
+
+    const auto messages = Messages(Rux::Linting::Lint(source, "width.rux"));
+    REQUIRE_EQ(messages.size(), 1);
+    CHECK_EQ(messages[0], "comment line is 121 columns wide, over the limit of 120");
+}
+
+TEST_CASE("a wide line of code is left to the formatter") {
+    const std::string source = "func Main() -> int { let value = 0; " + std::string(100, ' ') + "return value; }\n";
+
+    CHECK(Messages(Rux::Linting::Lint(source, "width.rux")).empty());
+}
+
+TEST_CASE("an unknown lint rule is rejected where it is written") {
+    const std::string source = R"(
+#Allow("docs.mising")
+pub func Open() -> int32 { return 0i32; }
+)";
+    const auto result = Rux::Linting::Lint(source, "allow.rux");
+
+    REQUIRE(result.HasErrors());
+    CHECK_EQ(result.diagnostics.front().message,
+             "unknown lint rule 'docs.mising'; valid rules are: naming.type, naming.const, docs.missing, docs.api-url");
 }

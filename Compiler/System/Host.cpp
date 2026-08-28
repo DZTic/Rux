@@ -16,15 +16,13 @@
     #include <mach/mach_host.h>
     #include <sys/sysctl.h>
     #include <unistd.h>
-#elif RUX_IS_BSD
+#elif RUX_OS_FREEBSD
     #include <sys/sysctl.h>
-    #include <unistd.h>
-#elif RUX_IS_SUNOS
     #include <unistd.h>
 #endif
 
-#if RUX_ARCH_X86 || RUX_ARCH_X86_64
-    #if RUX_COMPILER_MSVC
+#if RUX_ARCH_X86_64
+    #if RUX_OS_WINDOWS
         #include <intrin.h>
     #else
         #include <cpuid.h>
@@ -35,12 +33,36 @@ namespace Rux::System {
 using namespace Target;
 
 namespace {
-#if RUX_ARCH_X86 || RUX_ARCH_X86_64
+#if RUX_OS_WINDOWS
+[[nodiscard]] Arch WindowsArchitecture(const WORD architecture) noexcept {
+    switch (architecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64:
+        return Arch::X86_64;
+    case PROCESSOR_ARCHITECTURE_ARM64:
+        return Arch::AArch64;
+    default:
+        return Arch::Unknown;
+    }
+}
+
+[[nodiscard]] Arch WindowsImageArchitecture(const USHORT machine) noexcept {
+    switch (machine) {
+    case IMAGE_FILE_MACHINE_AMD64:
+        return Arch::X86_64;
+    case IMAGE_FILE_MACHINE_ARM64:
+        return Arch::AArch64;
+    default:
+        return Arch::Unknown;
+    }
+}
+#endif
+
+#if RUX_ARCH_X86_64
 
 [[nodiscard]] inline bool HasOSXSAVE() noexcept {
     int r[4]{};
 
-    #if RUX_COMPILER_MSVC
+    #if RUX_OS_WINDOWS
     __cpuid(r, 1);
     #else
     __cpuid(1, r[0], r[1], r[2], r[3]);
@@ -50,7 +72,7 @@ namespace {
 }
 
 [[nodiscard]] inline uint64_t XGetBV0() noexcept {
-    #if RUX_COMPILER_MSVC
+    #if RUX_OS_WINDOWS
     return _xgetbv(0);
     #else
     uint32_t a, d;
@@ -64,11 +86,11 @@ namespace {
 [[nodiscard]] CpuFeatures DetectCpuFeaturesImpl() noexcept {
     CpuFeatures f = CpuFeature::None;
 
-#if RUX_ARCH_X86 || RUX_ARCH_X86_64
+#if RUX_ARCH_X86_64
 
     int r[4]{};
 
-    #if RUX_COMPILER_MSVC
+    #if RUX_OS_WINDOWS
     __cpuid(r, 1);
     #else
     __cpuid(1, r[0], r[1], r[2], r[3]);
@@ -100,7 +122,7 @@ namespace {
         }
     }
 
-    #if RUX_COMPILER_MSVC
+    #if RUX_OS_WINDOWS
     __cpuidex(r, 7, 0);
     #else
     __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
@@ -116,7 +138,7 @@ namespace {
         f |= CpuFeature::AVX512;
     }
 
-#elif RUX_ARCH_AARCH64 || RUX_ARCH_ARM32
+#elif RUX_ARCH_AARCH64
 
     #if RUX_OS_LINUX
     unsigned long hw = getauxval(AT_HWCAP);
@@ -128,17 +150,6 @@ namespace {
     }
     #elif RUX_OS_MACOS
     f |= CpuFeature::NEON;
-    #else
-    f = HostCpuFeatures;
-    #endif
-
-#elif RUX_ARCH_RISCV64 || RUX_ARCH_RISCV32
-
-    #if RUX_OS_LINUX
-    unsigned long hw = getauxval(AT_HWCAP);
-    if (hw & (1 << ('V' - 'A'))) {
-        f |= CpuFeature::RVV;
-    }
     #else
     f = HostCpuFeatures;
     #endif
@@ -192,29 +203,13 @@ namespace {
 
     info.physical_cores = info.logical_cores;
 
-#elif RUX_IS_SUNOS
-
-    info.physical_cores = info.logical_cores;
-
-#elif RUX_OS_MACOS || (RUX_IS_BSD && !RUX_OS_OPENBSD)
+#elif RUX_OS_MACOS || RUX_OS_FREEBSD
 
     size_t s = sizeof(info.physical_cores);
     sysctlbyname("hw.physicalcpu", &info.physical_cores, &s, nullptr, 0);
 
     s = sizeof(info.cache_line_size);
     sysctlbyname("hw.cachelinesize", &info.cache_line_size, &s, nullptr, 0);
-
-#elif RUX_OS_OPENBSD
-
-    int mib_cores[2] = {CTL_HW, HW_NCPU};
-    size_t s = sizeof(info.physical_cores);
-    sysctl(mib_cores, 2, &info.physical_cores, &s, nullptr, 0);
-
-    #ifdef HW_CACHELINE
-    int mib_cache[2] = {CTL_HW, HW_CACHELINE};
-    s = sizeof(info.cache_line_size);
-    sysctl(mib_cache, 2, &info.cache_line_size, &s, nullptr, 0);
-    #endif
 
 #endif
 
@@ -234,6 +229,43 @@ namespace {
     return info;
 }
 } // namespace
+
+HostArchitectureInfo GetHostArchitectureInfo() noexcept {
+    HostArchitectureInfo info{.processArch = HostArch, .nativeArch = HostArch};
+#if RUX_OS_WINDOWS
+    SYSTEM_INFO systemInfo{};
+    GetNativeSystemInfo(&systemInfo);
+    if (const Arch nativeArch = WindowsArchitecture(systemInfo.wProcessorArchitecture); nativeArch != Arch::Unknown) {
+        info.nativeArch = nativeArch;
+    }
+    // An x86-64 process under Windows-on-ARM may see an AMD64 compatibility
+    // view through GetNativeSystemInfo. IsWow64Process2 reports the actual
+    // native machine explicitly. Resolve it dynamically so Rux retains the
+    // system-information fallback on Windows versions predating that API.
+    using IsWow64Process2Fn = BOOL(WINAPI *)(HANDLE, USHORT *, USHORT *);
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    // GetProcAddress returns FARPROC, whose signature never matches the symbol
+    // being resolved; go through void * so the cast stays a plain pointer
+    // conversion instead of an incompatible function-type cast.
+    void *const isWow64Process2Address =
+        kernel32 == nullptr ? nullptr : reinterpret_cast<void *>(GetProcAddress(kernel32, "IsWow64Process2"));
+    const auto isWow64Process2 = reinterpret_cast<IsWow64Process2Fn>(isWow64Process2Address);
+    USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    if (isWow64Process2 != nullptr && isWow64Process2(GetCurrentProcess(), &processMachine, &nativeMachine)) {
+        if (const Arch nativeArch = WindowsImageArchitecture(nativeMachine); nativeArch != Arch::Unknown) {
+            info.nativeArch = nativeArch;
+        }
+    }
+#elif RUX_OS_MACOS && RUX_ARCH_X86_64
+    int translated = 0;
+    std::size_t size = sizeof(translated);
+    if (sysctlbyname("sysctl.proc_translated", &translated, &size, nullptr, 0) == 0 && translated == 1) {
+        info.nativeArch = Arch::AArch64;
+    }
+#endif
+    return info;
+}
 
 RuntimeCpuInfo GetRuntimeCpuInfo() noexcept {
     return CachedCpuInfo();
@@ -261,18 +293,6 @@ MemoryInfo GetRuntimeMemoryInfo() noexcept {
         info.available_bytes = uint64_t(s.freeram) * s.mem_unit;
     }
 
-#elif RUX_IS_SUNOS
-
-    {
-        long pages = sysconf(_SC_PHYS_PAGES);
-        long avpages = sysconf(_SC_AVPHYS_PAGES);
-        long psize = sysconf(_SC_PAGESIZE);
-        if (pages > 0 && psize > 0) {
-            info.total_bytes = uint64_t(pages) * uint64_t(psize);
-            info.available_bytes = uint64_t(avpages > 0 ? avpages : pages) * uint64_t(psize);
-        }
-    }
-
 #elif RUX_OS_MACOS
 
     int mib[2] = {CTL_HW, HW_MEMSIZE};
@@ -291,11 +311,9 @@ MemoryInfo GetRuntimeMemoryInfo() noexcept {
         info.available_bytes = info.total_bytes;
     }
 
-#elif RUX_IS_BSD
+#elif RUX_OS_FREEBSD
 
-    #if defined(HW_MEMSIZE)
-    int mib[2] = {CTL_HW, HW_MEMSIZE};
-    #elif defined(HW_REALMEM)
+    #if defined(HW_REALMEM)
     int mib[2] = {CTL_HW, HW_REALMEM};
     #else
     int mib[2] = {CTL_HW, HW_PHYSMEM};

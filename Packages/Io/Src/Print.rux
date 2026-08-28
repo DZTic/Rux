@@ -1,228 +1,274 @@
-import Format::{ Format, Stringable, ToString };
-import Memory::{ Alloc, Free };
-import Rux::{ #target };
-import Text::String;
+// Printing, with the failure a caller can act on returned rather than swallowed.
+//
+// Every overload returns the `IoError` of the write it made. Most call sites will keep ignoring it, and that is
+// now their decision rather than this module's: a program logging to a terminal loses nothing by not looking,
+// while one whose output feeds a closed pipe finally has something to look at. The bytes go through the standard
+// output handle, so the console-versus-redirection encoding is decided where it always is, not re-decided here.
 
-when #target.os {
-    .DragonFlyBSD, .FreeBSD, .NetBSD, .OpenBSD => import Bsd::{ StdOut, Write },
-    .Linux => import Linux::{ StdOut, Write },
-    .MacOS => import MacOS::{ StdOut, Write },
-    .Windows => import Windows::{
-        CodePage,
-        GetConsoleMode,
-        GetStdHandle,
-        MultiByteToWideChar,
-        StdOutputHandle,
-        WriteConsoleW,
-        WriteFile
+import Format::{ Display, FormatSpec, TextWriter, WriteFormat };
+import Text::{ String, StringView, TextError };
+
+// The one write under everything here.
+func PrintBytes(bytes: Slice<char8>) -> IoError {
+    var out = StandardOut::Acquire();
+    return WriteAll(out, bytes);
+}
+
+/// A `TextWriter` over standard output that records the stream's failure where the caller can see it.
+///
+/// The formatting interfaces speak `TextError`, which has no vocabulary for a broken stream; so the writer
+/// reports `None` to the formatter -- the formatting itself did not fail -- while recording the `IoError` in the
+/// slot it was built over and discarding everything after the failure. The caller reads the slot when the value
+/// is done writing itself.
+///
+/// https://rux-lang.dev/docs/api/io/console-writer
+pub struct ConsoleWriter {
+    /// Where the first stream failure is recorded.
+    failure: *var IoError;
+}
+
+extend ConsoleWriter {
+    /// A writer over standard output, recording into `failure`.
+    ///
+    /// https://rux-lang.dev/docs/api/io/console-writer/new
+    pub func ConsoleWriter(failure: *var IoError) -> ConsoleWriter {
+        return ConsoleWriter { failure: failure };
+    }
+
+}
+
+extend ConsoleWriter : TextWriter {
+    /// Writes `bytes` to standard output, unless a failure has already been recorded.
+    ///
+    /// https://rux-lang.dev/docs/api/io/console-writer/write
+    pub func Write(self: &var ConsoleWriter, bytes: Slice<char8>) -> TextError {
+        if (*self.failure).IsError() {
+            return TextError::None;
+        }
+        let outcome = PrintBytes(bytes);
+        if outcome.IsError() {
+            *self.failure = outcome;
+        }
+        return TextError::None;
     }
 }
 
-when #target.os == .Windows {
-    // Write raw bytes to a redirected stdout (a file or pipe), where the UTF-8
-    // encoding of `data` is already exactly what should land on disk.
-    func WriteBytes(handle: *opaque, data: *char8, length: uint) {
-        const MaxWriteLength: uint = 4096;
-        var offset: uint = 0;
-        while offset < length {
-            var written: uint32 = 0;
-            let remaining = length - offset;
-            let count = remaining > MaxWriteLength ? MaxWriteLength : remaining;
-            let ok = WriteFile(
-                handle,
-                (data + offset) as *opaque,
-                count as uint32,
-                @written,
-                null
-            );
-            if !ok || written == 0 { return; }
-            offset += written as uint;
-        }
+// A formatting failure on a healthy stream, carried in the one error type this surface returns. The raw value
+// is the `TextError`, so nothing is lost to the translation.
+func OfTextFailure(failure: TextError) -> IoError {
+    return IoError { kind: IoErrorKind::InvalidText, raw: failure as int32 };
+}
+
+/// Writes a value's text to standard output.
+///
+/// Nothing is allocated: the value writes itself straight to the stream. A stream failure is returned; a
+/// formatting failure on a healthy stream comes back as `InvalidText` with the `TextError` in `raw`.
+///
+/// https://rux-lang.dev/docs/api/io/print-value
+pub func PrintValue(value: Display) -> IoError {
+    var failure = IoError::Ok();
+    var sink = ConsoleWriter(@failure);
+    let writer: &var TextWriter = sink;
+    let formatted = value.Format(writer, FormatSpec::Plain());
+    if failure.IsError() {
+        return failure;
     }
-
-    // Write UTF-16 code units to a console. WriteConsoleW hands the characters
-    // to the console as Unicode, so they render correctly no matter what the
-    // console's output code page is.
-    func WriteWide(handle: *opaque, data: *char16, length: uint) {
-        var offset: uint = 0;
-        while offset < length {
-            var written: uint32 = 0;
-            let ok = WriteConsoleW(
-                handle,
-                data + offset,
-                (length - offset) as uint32,
-                @written,
-                null
-            );
-            if !ok || written == 0 { return; }
-            offset += written as uint;
-        }
+    if formatted != TextError::None {
+        return OfTextFailure(formatted);
     }
+    return IoError::Ok();
 }
 
-func Print(data: *char8, length: uint) {
-    if length == 0 { return; }
+/// Writes a value's text to standard output, then a newline.
+///
+/// https://rux-lang.dev/docs/api/io/print-value-line
+pub func PrintValueLine(value: Display) -> IoError {
+    let first = PrintValue(value);
+    let second = PrintLine();
+    return first.IsError() ? first : second;
+}
 
-    when #target.os == .Windows {
-        let handle = GetStdHandle(StdOutputHandle);
-        // Only a console needs the UTF-16 path. GetConsoleMode succeeds for a
-        // console handle and fails when stdout is redirected to a file or pipe,
-        // where the raw UTF-8 bytes are the correct output. Writing UTF-8 bytes
-        // to a console would instead be decoded with its code page and turn any
-        // non-ASCII text (such as "Привіт світ!") into mojibake.
-        var mode: uint32 = 0;
-        if !GetConsoleMode(handle, @mode) {
-            WriteBytes(handle, data, length);
-            return;
-        }
-        // A UTF-8 sequence never expands to more UTF-16 code units than it has
-        // bytes, so `length` units is a safe upper bound for the buffer.
-        let wide = Alloc(length * 2) as *char16;
-        if wide == null {
-            WriteBytes(handle, data, length);
-            return;
-        }
-        let wideLength = MultiByteToWideChar(CodePage::Utf8 as uint32,
-            0, data, length as int32, wide, length as int32);
-        if wideLength > 0 {
-            WriteWide(handle, wide, wideLength as uint);
-        }
-        Free(wide as *opaque);
-    } else {
-        var offset: uint = 0;
-        while offset < length {
-            let written = Write(
-                StdOut,
-                (data + offset) as *opaque,
-                length - offset
-            );
-            // EINTR means no bytes were written and the operation can be
-            // retried without advancing the buffer.
-            if written == -4 { continue; }
-            if written <= 0 { return; }
-            offset += written as uint;
-        }
+/// Writes a string to standard output.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: String) -> IoError {
+    return PrintBytes(Slice<char8> { data: value.data, length: value.length });
+}
+
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: StringView) -> IoError {
+    return PrintBytes(value.Bytes());
+}
+
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: Slice<char8>) -> IoError {
+    return PrintBytes(value);
+}
+
+/// Writes `format` to standard output with each `{}` replaced by the next argument.
+///
+/// Allocates nothing: the arguments write themselves to the stream as they are reached. Failures report as
+/// `PrintValue`'s do.
+///
+/// https://rux-lang.dev/docs/api/io/print-format
+pub func Print(format: Slice<char8>, args: Display...) -> IoError {
+    var failure = IoError::Ok();
+    var sink = ConsoleWriter(@failure);
+    let writer: &var TextWriter = sink;
+    let formatted = WriteFormat(writer, format, args...);
+    if failure.IsError() {
+        return failure;
     }
+    if formatted != TextError::None {
+        return OfTextFailure(formatted);
+    }
+    return IoError::Ok();
 }
 
-func Print(value: String) {
-    Print(value.data, value.length);
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: bool8) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: Slice<char8>) {
-    Print(value.data, value.length);
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: bool16) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(format: Slice<char8>, args: Stringable...) {
-    var text = Format(format, args...);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: bool32) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: bool8) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: char8) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: bool16) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: char16) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: bool32) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: char32) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: char8) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: int8) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: char16) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: int16) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: char32) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: int32) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: int8) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: int64) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: int16) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: uint8) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: int32) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: uint16) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: int64) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: uint32) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: uint8) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: uint64) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: uint16) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: int) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: uint32) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: uint) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: uint64) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: float32) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }
 
-func Print(value: int) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
-}
-
-func Print(value: uint) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
-}
-
-func Print(value: float32) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
-}
-
-func Print(value: float64) {
-    var text = ToString(value);
-    Print(text);
-    text.Free();
+/// Provides the public `Print` operation.
+///
+/// https://rux-lang.dev/docs/api/io/print
+pub func Print(value: float64) -> IoError {
+    let shown: Display = value;
+    return PrintValue(shown);
 }

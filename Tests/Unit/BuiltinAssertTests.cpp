@@ -3,6 +3,7 @@
 #include "Lexer/Lexer.h"
 #include "Lowering/AstToHir/AstToHir.h"
 #include "Lowering/HirToLir/HirToLir.h"
+#include "Optimization/Pipeline.h"
 #include "Semantic/SemanticAnalyzer.h"
 #include "Syntax/Parser/Parser.h"
 #include "Target/Platform.h"
@@ -34,13 +35,16 @@ LirPackage CompileToLir(const std::string &source, const bool debugAssertions) {
     REQUIRE_FALSE(parsed.HasErrors());
 
     CompileTimeContext context;
-    context.debugAssertions = debugAssertions;
+    context.profile = debugAssertions ? BuildProfile::Debug : BuildProfile::Release;
     SemanticAnalyzer analyzer({&parsed.module}, {}, "test", context);
     auto model = analyzer.Analyze();
     REQUIRE_FALSE(model.HasErrors());
 
     AstToHirLowering hirLowering(model);
-    HirToLirLowering lirLowering(hirLowering.Generate());
+    auto hir = hirLowering.Generate();
+    auto pipeline = Optimization::OptimizationPipeline::ForProfile(context.profile);
+    REQUIRE(pipeline.RunHir(hir).reachedFixedPoint);
+    HirToLirLowering lirLowering(std::move(hir), context.target);
     return lirLowering.Generate();
 }
 
@@ -153,7 +157,7 @@ TEST_CASE("assertion intrinsics require declarations and enforce their signature
         func Main() { Assert(true, "missing import"); }
     )");
     CHECK(std::ranges::any_of(undefinedDiagnostics, [](const SemanticDiagnostic &diagnostic) {
-        return diagnostic.message == "undefined name 'Assert'";
+        return diagnostic.message == "name 'Assert' is not defined in this scope";
     }));
 
     const auto signatureDiagnostics = Analyze(R"(
@@ -167,10 +171,11 @@ TEST_CASE("assertion intrinsics require declarations and enforce their signature
         }
     )");
     CHECK(std::ranges::any_of(signatureDiagnostics, [](const SemanticDiagnostic &diagnostic) {
-        return diagnostic.message ==
-               "no matching overload for 'Assert' with argument types (Slice<char8>, Slice<char8>)";
+        return diagnostic.message == "argument 1 to 'Assert' has type 'Slice<char8>', but parameter 'condition' "
+                                     "requires 'bool8'";
     }));
     CHECK(std::ranges::any_of(signatureDiagnostics, [](const SemanticDiagnostic &diagnostic) {
-        return diagnostic.message == "no matching overload for 'DebugAssert' with argument types (bool8, int)";
+        return diagnostic.message ==
+               "argument 2 to 'DebugAssert' has type 'int', but parameter 'message' requires 'Slice<char8>'";
     }));
 }

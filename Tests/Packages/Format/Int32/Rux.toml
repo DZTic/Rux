@@ -1,10 +1,14 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "Int32"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Package test for Format: Int32"
 
 [Dependencies]
+Core = { Path = "../../../../Packages/Core" }
 Format = { Path = "../../../../Packages/Format" }
 Text = { Path = "../../../../Packages/Text" }
 

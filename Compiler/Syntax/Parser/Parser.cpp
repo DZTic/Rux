@@ -3,6 +3,7 @@
 #include "Syntax/Parser/Parser.h"
 
 #include <cassert>
+#include <format>
 #include <optional>
 #include <string>
 #include <utility>
@@ -20,16 +21,18 @@ bool ParseResult::HasErrors() const noexcept {
 }
 
 // Constructor / FromLexResult
-Parser::Parser(std::vector<Token> inputTokens, std::string inputSourceName)
+Parser::Parser(std::vector<Token> inputTokens, std::string inputSourceName, const Target::Arch inputArch)
     : tokens(std::move(inputTokens))
-    , sourceName(std::move(inputSourceName)) {
+    , sourceName(std::move(inputSourceName))
+    , arch(inputArch) {
 }
 
-std::optional<ParseResult> Parser::FromLexResult(const LexerResult &lex, const std::string &sourceName) {
+std::optional<ParseResult> Parser::FromLexResult(const LexerResult &lex, const std::string &sourceName,
+                                                 const Target::Arch arch) {
     if (lex.HasErrors()) {
         return std::nullopt;
     }
-    Parser p(lex.tokens, sourceName);
+    Parser p(lex.tokens, sourceName, arch);
     return p.Parse();
 }
 
@@ -48,6 +51,23 @@ ParseResult Parser::Parse() {
     }
 
     return ParseResult{std::move(mod), std::move(diagnostics)};
+}
+
+std::string Parser::ParseDocumentation() {
+    std::string documentation;
+    std::uint32_t previousLine = 0;
+    while (Check(TokenKind::DocComment)) {
+        const Token &comment = Advance();
+        if (previousLine != 0 && comment.location.line != previousLine + 1)
+            documentation.clear();
+        if (!documentation.empty())
+            documentation += '\n';
+        documentation += comment.text;
+        previousLine = comment.location.line;
+    }
+    if (previousLine != 0 && CurrentLocation().line > previousLine + 1)
+        documentation.clear();
+    return documentation;
 }
 
 // Token helpers
@@ -79,6 +99,47 @@ bool Parser::CheckAny(const std::initializer_list<TokenKind> kinds) const noexce
     return false;
 }
 
+namespace {
+/// How many generic argument lists a token could close. `Slice<Slice<int32>>` ends two at once and the lexer hands
+/// that over as a single `>>`, so a lookahead that counts only a bare `>` never sees the list close.
+int CloseAngleCount(const TokenKind kind) noexcept {
+    switch (kind) {
+    case TokenKind::Greater:
+        return 1;
+    case TokenKind::GreaterGreater:
+        return 2;
+    case TokenKind::GreaterGreaterGreater:
+        return 3;
+    default:
+        return 0;
+    }
+}
+} // namespace
+
+bool Parser::CheckCloseAngle() const noexcept {
+    return CheckAny({TokenKind::Greater, TokenKind::GreaterGreater, TokenKind::GreaterGreaterGreater});
+}
+
+void Parser::ConsumeCloseAngle() noexcept {
+    // `Slice<Slice<int32>>` ends two argument lists with one token. The lexer cannot tell that from a shift, so the
+    // run is narrowed here instead: take the first `>` by shortening the token in place and leave the remainder for
+    // the enclosing list. The location moves with it, so a diagnostic still points at the `>` it means.
+    Token &token = tokens[pos];
+    if (token.kind == TokenKind::GreaterGreaterGreater) {
+        token.kind = TokenKind::GreaterGreater;
+        token.text = ">>";
+        token.location.column += 1;
+        return;
+    }
+    if (token.kind == TokenKind::GreaterGreater) {
+        token.kind = TokenKind::Greater;
+        token.text = ">";
+        token.location.column += 1;
+        return;
+    }
+    Advance();
+}
+
 bool Parser::Match(const TokenKind kind) noexcept {
     if (!Check(kind)) {
         return false;
@@ -93,6 +154,23 @@ const Token &Parser::Expect(const TokenKind kind, const std::string_view message
     }
     EmitError(CurrentLocation(), std::string(message));
     return Peek(); // return without advancing
+}
+
+const Token &Parser::ExpectBefore(const TokenKind kind, const std::string_view expected,
+                                  std::optional<std::string> help) {
+    if (Check(kind)) {
+        return Advance();
+    }
+    EmitExpected(CurrentLocation(), expected, std::move(help));
+    return Peek();
+}
+
+bool Parser::ConsumeBodyStart(const std::string_view role) {
+    if (Match(TokenKind::LeftBrace)) {
+        return true;
+    }
+    EmitExpected(CurrentLocation(), std::format("'{{' to start {}", role));
+    return false;
 }
 
 bool Parser::IsAtEnd() const noexcept {
@@ -125,8 +203,8 @@ bool Parser::IsGenericStructInitAhead() const noexcept {
             continue;
         }
 
-        if (kind == TokenKind::Greater) {
-            --angleDepth;
+        if (const int closers = CloseAngleCount(kind); closers > 0) {
+            angleDepth -= closers;
             if (angleDepth == 0) {
                 return Peek(ahead + 1).kind == TokenKind::LeftBrace;
             }
@@ -194,8 +272,8 @@ bool Parser::IsGenericCallAhead() const noexcept {
             continue;
         }
 
-        if (kind == TokenKind::Greater) {
-            --angleDepth;
+        if (const int closers = CloseAngleCount(kind); closers > 0) {
+            angleDepth -= closers;
             if (angleDepth == 0) {
                 return Peek(ahead + 1).kind == TokenKind::LeftParen;
             }
@@ -218,12 +296,14 @@ bool Parser::IsTypeArgListAhead() const noexcept {
             ++angleDepth;
             continue;
         case TokenKind::Greater:
-            --angleDepth;
-            if (angleDepth == 0) {
+        case TokenKind::GreaterGreater:
+        case TokenKind::GreaterGreaterGreater:
+            // This lookahead runs from the innermost list, so a `>>` supplies one closer for it and the rest for the
+            // lists enclosing it. Reaching zero or below means this list closed; the surplus is not an error here,
+            // unlike in the call and struct-initializer lookaheads, which start at the outermost `<`.
+            angleDepth -= CloseAngleCount(Peek(ahead).kind);
+            if (angleDepth <= 0) {
                 return true;
-            }
-            if (angleDepth < 0) {
-                return false;
             }
             continue;
         case TokenKind::Ident:
@@ -244,12 +324,26 @@ bool Parser::IsTypeArgListAhead() const noexcept {
 }
 
 // Diagnostics
-void Parser::EmitError(const SourceLocation loc, std::string message) {
-    diagnostics.push_back(ParserDiagnostic{ParserDiagnostic::Severity::Error, sourceName, loc, std::move(message)});
+void Parser::EmitError(const SourceLocation loc, std::string message, std::optional<std::string> help) {
+    diagnostics.push_back(ParserDiagnostic{
+        ParserDiagnostic::Severity::Error, sourceName, loc, std::move(message), {}, std::move(help), {}});
+}
+
+void Parser::EmitExpected(const SourceLocation loc, const std::string_view expected, std::optional<std::string> help) {
+    const std::string unexpected = IsAtEnd() ? "end of file" : std::format("'{}'", Peek().text);
+    Diagnostic diagnostic{ParserDiagnostic::Severity::Error,
+                          sourceName,
+                          loc,
+                          std::format("expected {} before {}", expected, unexpected),
+                          {},
+                          std::move(help),
+                          {}};
+    diagnostics.push_back(std::move(diagnostic));
 }
 
 void Parser::EmitWarning(const SourceLocation loc, std::string message) {
-    diagnostics.push_back(ParserDiagnostic{ParserDiagnostic::Severity::Warning, sourceName, loc, std::move(message)});
+    diagnostics.push_back(
+        ParserDiagnostic{ParserDiagnostic::Severity::Warning, sourceName, loc, std::move(message), {}, {}, {}});
 }
 
 void Parser::Synchronize() {
@@ -288,5 +382,12 @@ void Parser::Recover() {
     if (pos == before && !IsAtEnd()) {
         Advance();
     }
+}
+
+bool Parser::RecoverDelimitedList(const TokenKind closing) {
+    while (!CheckAny({TokenKind::Comma, closing, TokenKind::Semicolon, TokenKind::RightBrace}) && !IsAtEnd()) {
+        Advance();
+    }
+    return Match(TokenKind::Comma);
 }
 } // namespace Rux

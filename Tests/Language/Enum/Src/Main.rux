@@ -1,4 +1,4 @@
-import Rux::Assert;
+import Core::Assert;
 
 enum Direction {
     North = 10,
@@ -24,8 +24,58 @@ enum Shape {
     Point
 }
 
+// A tag is stored at the enum's declared width, so a match has to read it back
+// at that width. Reading it as a full word instead picked up whatever sat
+// beside it, and the mask that cleared those bits was itself 32 bits wide, so
+// matching an enum based on a narrower type used to select no arm at all.
+enum Narrow: int8 {
+    Low = 0,
+    High = 1
+}
+
+enum Ordering: int8 {
+    Less = -1,
+    Equal = 0,
+    Greater = 1
+}
+
+enum Halfword: int16 {
+    Low = 0,
+    High = 1
+}
+
+func Classify(value: int32) -> Ordering {
+    if value < 0 {
+        return Ordering::Less;
+    }
+    if value > 0 {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
 func IdentityDirection(direction: Direction) -> Direction {
     return direction;
+}
+
+// A payload-carrying enum passed by value. Its size is the tag plus the widest
+// payload, not the tag alone, so a call has to carry the whole value.
+enum Parcel {
+    Nothing,
+    Count(int64),
+    Pair(int32, int32)
+}
+
+func UnwrapCount(parcel: Parcel) -> int64 {
+    return match parcel {
+        .Nothing => 0i64,
+        .Count(n) => n,
+        .Pair(a, b) => (a as int64) + (b as int64)
+    };
+}
+
+func Relay(parcel: Parcel) -> int64 {
+    return UnwrapCount(parcel);
 }
 
 func Main() -> int {
@@ -49,5 +99,51 @@ func Main() -> int {
         else => 2
     };
     Assert(fallback == 2, "Expected the else match arm");
+
+    // A tag narrower than a word still selects the right arm.
+    let narrow = Narrow::High;
+    Assert((match narrow { .Low => 10, .High => 20 }) == 20, "Expected an int8 tag to match its arm");
+    let halfword = Halfword::High;
+    Assert((match halfword { .Low => 10, .High => 20 }) == 20, "Expected an int16 tag to match its arm");
+    let byteColor = Color::Green;
+    Assert((match byteColor { .Red => 1, .Green => 2, .Blue => 3 }) == 2, "Expected a uint8 tag to match its arm");
+
+    // Negative discriminants survive being read back and compared.
+    Assert((match Classify(-5) { .Less => 1, .Equal => 2, .Greater => 3 }) == 1,
+           "Expected a negative discriminant to match its arm");
+    Assert((match Classify(0) { .Less => 1, .Equal => 2, .Greater => 3 }) == 2,
+           "Expected a zero discriminant to match its arm");
+    Assert((match Classify(5) { .Less => 1, .Equal => 2, .Greater => 3 }) == 3,
+           "Expected a positive discriminant to match its arm");
+
+    // The tag is unaffected by a neighbouring local, which is what a full-width
+    // read used to pick up.
+    let before: int64 = -1i64;
+    let neighbour = Narrow::Low;
+    let after: int64 = -1i64;
+    Assert((match neighbour { .Low => 10, .High => 20 }) == 10, "Expected a tag to ignore its neighbours");
+    Assert(before == -1i64 && after == -1i64, "Expected the neighbours themselves to be intact");
+
+    // A payload-carrying enum passed by value keeps its payload. Sizing such an
+    // enum by its tag alone left the payload behind at the call boundary and the
+    // callee read whatever happened to sit past the tag.
+    Assert(UnwrapCount(Parcel::Count(42i64)) == 42i64, "Expected a by-value payload to survive the call");
+    Assert(UnwrapCount(Parcel::Nothing) == 0i64, "Expected an empty variant to pass by value");
+    Assert(UnwrapCount(Parcel::Pair(20i32, 22i32)) == 42i64, "Expected a two-field payload to pass by value");
+
+    // Through a binding, and through a second call that passes it on again.
+    let parcel = Parcel::Count(7i64);
+    Assert(UnwrapCount(parcel) == 7i64, "Expected a bound payload enum to pass by value");
+    Assert(Relay(Parcel::Count(9i64)) == 9i64, "Expected a payload enum to survive being relayed");
+
+    // Neighbouring locals are untouched: the value is copied whole rather than
+    // read past its own storage.
+    let guardBefore: int64 = 0x1122334455667788i64;
+    let carried = Parcel::Count(1234567890123i64);
+    let guardAfter: int64 = 0x08192A3B4C5D6E7Fi64;
+    Assert(UnwrapCount(carried) == 1234567890123i64, "Expected a wide payload to pass by value");
+    Assert(guardBefore == 0x1122334455667788i64, "Expected the preceding local to be intact");
+    Assert(guardAfter == 0x08192A3B4C5D6E7Fi64, "Expected the following local to be intact");
+
     return 0;
 }

@@ -1,0 +1,25 @@
+// rux:target linux-x86_64
+
+// The same mistake the other way round: an AArch64 body compiled for x86-64.
+// The operand syntax is read far enough to reach the mnemonic that names the
+// machine, so the report is about the architecture rather than about '#'.
+asm func Load(p: *int64) -> int64 {
+    ldr x0, [x0, #8]
+    ret
+}
+
+// A conditional branch carries its condition in its name, joined by a dot that
+// no x86-64 mnemonic has. It is read here for the same reason '#' is: a
+// `when #target.arch` arm written for another architecture has to parse before
+// it can be discarded, and what is not discarded is named as what it is.
+asm func Negative(a: int64) -> int64 {
+    cmp x0, xzr
+    b.lt done
+    mov x0, xzr
+done:
+    ret
+}
+
+func Main() -> int {
+    return 0;
+}

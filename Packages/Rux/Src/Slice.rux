@@ -1,4 +1,0 @@
-struct Slice<T> {
-    data: *T;
-    length: uint;
-}

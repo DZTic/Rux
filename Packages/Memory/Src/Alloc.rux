@@ -1,13 +1,13 @@
-import Rux::{ #target, #Error };
+import Core::{ #target, #Error };
 
 when #target.os {
-    .DragonFlyBSD, .FreeBSD, .NetBSD, .OpenBSD => import Bsd::{
+    .FreeBSD => import FreeBSD::{
         IsError, Mmap, MapAnonymous, MapPrivate, ProtectionRead, ProtectionWrite
     },
     .Linux => import Linux::{
         IsError, Mmap, MapAnonymous, MapPrivate, ProtectionRead, ProtectionWrite
     },
-    .MacOS => import MacOS::{
+    .macOS => import macOS::{
         IsError, Mmap, MapAnonymous, MapPrivate, ProtectionRead, ProtectionWrite
     },
     .Windows => import Windows::{
@@ -15,11 +15,23 @@ when #target.os {
     }
 }
 
-// Allocates an uninitialized block of memory
-// https://rux-lang.dev/api/memory/alloc
-func Alloc(size: uint) -> *var opaque {
+/// Allocates `size` uninitialized bytes.
+///
+/// Returns the base address, or null when the size overflows the platform bookkeeping or the system cannot satisfy
+/// the request. A zero size is permitted, but the returned address is platform-dependent and must not be touched.
+///
+/// The allocation is owned by the caller until `Free` releases it or `Realloc` replaces it. The address is aligned
+/// to at least 16 bytes on every supported target.
+///
+/// # Safety
+///
+/// The bytes are uninitialized. Reading any byte before writing it, accessing beyond `size`, or using the address
+/// after it is released is invalid.
+///
+/// https://rux-lang.dev/docs/api/memory/alloc
+pub func Alloc(size: uint) -> *var opaque {
     when #target.os {
-        .DragonFlyBSD, .FreeBSD, .Linux, .MacOS, .NetBSD, .OpenBSD => {
+        .FreeBSD, .Linux, .macOS => {
             // Two machine words keep the returned address aligned to 16 bytes.
             const HeaderSize: uint = 16;
             let total = size + HeaderSize;

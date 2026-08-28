@@ -1,0 +1,40 @@
+import Core::{ Assert, #source };
+
+// A dependency-free slice comparison, so the test can check the exact strings
+// the compiler fills in without pulling in Text for its String type.
+func SliceEquals(a: Slice<char8>, b: Slice<char8>) -> bool {
+    if a.length != b.length {
+        return false;
+    }
+    var i: uint = 0;
+    while i < a.length {
+        if a.data[i] != b.data[i] {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
+func Main() -> int {
+    // The location is one-based, so both coordinates sit past zero.
+    Assert(#source.line > 0, "line");
+    Assert(#source.column > 0, "column");
+
+    // The file name and the name of the function reading the value are what the
+    // compiler reports, exactly.
+    Assert(SliceEquals(#source.fileName, "Main.rux"), "fileName");
+    Assert(SliceEquals(#source.function, "Main"), "function");
+
+    // The full paths and the module name are populated.
+    Assert(#source.file.length > 0, "file");
+    Assert(#source.filePath.length > 0, "filePath");
+    Assert(#source.module.length > 0, "module");
+
+    // The value tracks the line it is read on: a read further down the file
+    // reports a greater line than one above it.
+    let first = #source.line;
+    let second = #source.line;
+    Assert(second > first, "line advances down the file");
+    return 0;
+}

@@ -16,11 +16,9 @@ permissions:
   contents: read
 
 # GitHub has no native FreeBSD runner, so each job runs a FreeBSD VM (via
-# QEMU) on an Ubuntu host. Build and Test are separate jobs: the Build VM
-# compiles rux and the binary is synced back to the host and uploaded as an
-# artifact; the Test VM downloads it and runs the suite. Each job boots its
-# own VM, so the toolchain is installed in both (the Test VM also needs the
-# Clang runtime libraries the binary links against).
+# QEMU) on an Ubuntu host. Build and Test use separate VMs. Transferred cross
+# acceptance adds a third boundary: an x86-64 VM produces a target-only payload
+# which a fresh AArch64 VM validates and launches without installing a compiler.
 jobs:
   build:
     name: Build (${{ matrix.label }})
@@ -37,7 +35,9 @@ jobs:
             vm_arch: aarch64
             artifact: rux-freebsd-aarch64
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The AArch64 VM is fully emulated, so compiling the compiler and complete
+    # unit suite takes more than the default two-and-a-half-hour allowance.
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -50,6 +50,9 @@ jobs:
           release: "14.4"
           arch: ${{ matrix.vm_arch }}
           usesh: true
+          # Match the Ubuntu host so the emulated build compiles in parallel.
+          cpu: 4
+          mem: 8192
           # Cache the prepared VM image so the LLVM and build-tool packages do
           # not need to be downloaded on every workflow run.
           cache-after-prepare: true
@@ -58,6 +61,7 @@ jobs:
             pkg install -y llvm22 cmake-core ninja
           run: |
             set -e
+            sh Run.sh policy
             cmake --version
             cmake -S . -B Build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
@@ -65,6 +69,7 @@ jobs:
               -DRUX_WERROR=ON \
               -DRUX_BUILD_TESTS=ON
             cmake --build Build --config Release --parallel
+            sh Run.sh format --check --rux-executable ./Bin/rux
             ctest --test-dir Build --output-on-failure -C Release
 
       - name: Upload binary artifact
@@ -91,7 +96,7 @@ jobs:
             vm_arch: aarch64
             artifact: rux-freebsd-aarch64
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -110,6 +115,8 @@ jobs:
           release: "14.4"
           arch: ${{ matrix.vm_arch }}
           usesh: true
+          cpu: 4
+          mem: 8192
           # The prebuilt binary needs the Clang runtime libraries. The
           # workspace and test manifests resolve first-party packages
           # locally, so no registry or Git client is needed.
@@ -121,3 +128,91 @@ jobs:
             ./Bin/rux check
             ./Bin/rux lint
             ./Bin/rux test --release
+            if [ "${{ matrix.arch }}" = aarch64 ]; then
+              sh Tests/Native/FreeBSDAArch64/Verify.sh ./Bin/rux
+            fi
+
+  cross-build:
+    name: Cross payload (x86-64 compiler)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download x86-64 compiler
+        uses: actions/download-artifact@v8
+        with:
+          name: rux-freebsd-x86_64
+          path: Bin
+
+      - name: Cross-build payload in FreeBSD x86-64 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          arch: x86_64
+          usesh: true
+          prepare: |
+            pkg install -y llvm22
+          run: |
+            set -e
+            chmod +x Bin/rux
+            sh Tests/Native/FreeBSDAArch64/BuildTransfer.sh ./Bin/rux FreeBSDAArch64Payload
+
+      - name: Upload target-only payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-x86_64-to-aarch64-runtime
+          path: FreeBSDAArch64Payload
+          if-no-files-found: error
+          retention-days: 7
+
+  cross-runtime:
+    name: Cross runtime (transferred to AArch64)
+    needs: cross-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout verifier
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download target-only payload
+        uses: actions/download-artifact@v8
+        with:
+          name: freebsd-x86_64-to-aarch64-runtime
+          path: FreeBSDAArch64Payload
+
+      - name: Run transferred bytes in fresh FreeBSD AArch64 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          arch: aarch64
+          usesh: true
+          cpu: 4
+          mem: 8192
+          run: |
+            set -e
+            sh Tests/Native/FreeBSDAArch64/VerifyTransfer.sh FreeBSDAArch64Payload
+
+  acceptance:
+    name: FreeBSD acceptance
+    if: ${{ always() }}
+    needs: [ test, cross-runtime ]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require native and transferred acceptance
+        env:
+          NATIVE_RESULT: ${{ needs.test.result }}
+          CROSS_RESULT: ${{ needs.cross-runtime.result }}
+        run: |
+          if [ "$NATIVE_RESULT" != success ] || [ "$CROSS_RESULT" != success ]; then
+            echo "::error::FreeBSD acceptance failed: native=$NATIVE_RESULT transferred=$CROSS_RESULT"
+            exit 1
+          fi
+          echo "FreeBSD native and transferred acceptance passed."

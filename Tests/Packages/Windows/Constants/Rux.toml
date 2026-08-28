@@ -1,11 +1,14 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "Constants"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Package test for Windows: constants and enum values"
 
 [Dependencies]
-Rux = { Path = "../../../../Packages/Rux" }
+Core = { Path = "../../../../Packages/Core" }
 Windows = { Path = "../../../../Packages/Windows" }
 
 [Build]

@@ -1,15 +1,23 @@
-import Text::{ String, StringBuilder };
+// The decimal text of a `uint64`.
 
-// The decimal text of a uint64, in a String the caller owns and frees. There
-// is no sign to write, so the digits stand alone.
-func ToString(value: uint64) -> String {
-    var builder = StringBuilder::WithCapacity(20);
-    WriteUint(@builder, value);
-    return builder.IntoString();
+import Text::TextError;
+
+extend uint64 : Display {
+    /// Writes this value's digits.
+    ///
+    /// Allocates nothing: the digits go into a buffer on the stack and reach the writer in one call.
+    ///
+    /// https://rux-lang.dev/docs/api/format/uint64/format
+    pub func Format(self: *uint64, writer: &var TextWriter, spec: FormatSpec) -> TextError {
+        return WriteIntegerSpec(writer, spec, *self, false);
+    }
 }
 
-extend uint64 : Stringable {
-    func ToString(self) -> String {
-        return ToString(*self);
+extend uint64 : Debug {
+    /// The same digits.
+    ///
+    /// https://rux-lang.dev/docs/api/format/uint64/format-debug
+    pub func FormatDebug(self: *uint64, writer: &var TextWriter, spec: FormatSpec) -> TextError {
+        return self.Format(writer, spec);
     }
 }

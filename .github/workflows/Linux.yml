@@ -91,18 +91,13 @@ jobs:
             artifact: rux-linux-aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    # AArch64 artifacts are encoded and linked in-process by the AArch64 back
+    # end, so this job needs no Clang at all.
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Install Clang 22
-        if: matrix.arch == 'aarch64'
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 22
 
       - name: Download binary artifact
         uses: actions/download-artifact@v8
@@ -129,3 +124,43 @@ jobs:
           ./Bin/rux check
           ./Bin/rux lint
           ./Bin/rux test --release
+
+  cross:
+    name: Cross (x86-64 host, AArch64 target)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: rux-linux-x86_64
+          path: Bin
+
+      # Restore the executable bit (artifacts don't preserve permissions).
+      - name: Make binary executable
+        run: chmod +x Bin/rux
+
+      - name: Build and inspect linux-aarch64 output
+        run: |
+          ./Bin/rux check --target linux-aarch64
+          ./Bin/rux --manifest Tests/Language/Arithmetic/Rux.toml build --release --target linux-aarch64
+          artifact=Bin/Tests/Language/Release/Linux/AArch64/Arithmetic
+          set -- $(od -An -v -t u1 -N 20 "$artifact")
+          test "$1" -eq 127 -a "$2" -eq 69 -a "$3" -eq 76 -a "$4" -eq 70
+          shift 18
+          test "$1" -eq 183 -a "$2" -eq 0
+
+      - name: Build and inspect macos-aarch64 output
+        shell: pwsh
+        run: |
+          ./Bin/rux check --target macos-aarch64
+          ./Tests/Native/MacOSAArch64/VerifyCross.ps1 -Rux ./Bin/rux
+
+      - name: Build and inspect freebsd-aarch64 output
+        run: sh Tests/Native/FreeBSDAArch64/VerifyCross.sh ./Bin/rux

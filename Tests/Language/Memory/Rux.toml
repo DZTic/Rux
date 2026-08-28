@@ -1,12 +1,15 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "MemoryTest"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Language test: MemoryTest"
 
 [Dependencies]
+Core = { Path = "../../../Packages/Core" }
 Memory = { Path = "../../../Packages/Memory" }
-Rux = { Path = "../../../Packages/Rux" }
 
 [Build]
 Output = "../../../Bin/Tests/Language"

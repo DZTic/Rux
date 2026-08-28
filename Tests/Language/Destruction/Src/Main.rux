@@ -1,0 +1,250 @@
+// Destruction has to run, run once, and run only where the value still lives.
+//
+// A destructor body has no way to report anything, so every check below counts instead: each tracked value holds a pointer
+// to a counter and bumps it as it is destroyed. The count after a construct is what says destruction happened at the
+// right place -- and, for a value that was moved away, that it did not happen twice.
+
+import Core::{ Assert, Option };
+
+struct Counter {
+    count: int32;
+}
+
+struct Tracked {
+    counter: *var Counter;
+}
+
+extend Tracked {
+    func =(self: &var Tracked, other: &Tracked);
+
+    func ~Tracked(self: &var Tracked) {
+        self.counter.count = self.counter.count + 1;
+    }
+}
+
+struct Pair {
+    first: Tracked;
+    second: Tracked;
+}
+
+// A generic holder, so the question "does handing a value over consume it" is asked where the answer depends on what
+// the type parameter stands for. The body is checked once with `T` standing for nothing in particular; whether the
+// store below moves or copies can only be settled at each instantiation.
+struct Holder<T> {
+    slot: *var T;
+    filled: bool;
+}
+
+extend Holder<T> {
+    func Put(self: &var Holder<T>, value: T) {
+        *self.slot <- value;
+        self.filled = true;
+    }
+}
+
+func PutThroughGeneric<T>(slot: *var T, value: T) {
+    *slot <- value;
+}
+
+// A payload with something ahead of the part that has to be destroyed, so the destruction of an option's payload has
+// to find a field rather than assume the payload begins with it.
+struct Entry {
+    key: int32;
+    value: Tracked;
+}
+
+// Two fields to destroy at different depths, so an option carrying an aggregate is not only a one-field case.
+struct Nested {
+    tag: int32;
+    inner: Entry;
+    trailing: Tracked;
+}
+
+// A scope for an option holding an aggregate, so its destruction happens somewhere observable.
+func HoldEntry(counter: *var Counter) {
+    let held = Option::Some<Entry>(Entry { key: 7, value: MakeTracked(counter) });
+}
+
+func HoldNested(counter: *var Counter) {
+    let held = Option::Some<Nested>(Nested {
+        tag: 3,
+        inner: Entry { key: 7, value: MakeTracked(counter) },
+        trailing: MakeTracked(counter)
+    });
+}
+
+// Matching an option by value takes its payload out: the arm's binding owns it and destroys it when the arm ends.
+func MatchAndDiscard(held: Option<Tracked>) {
+    match <-held {
+        .Some(value) => {
+        },
+        .None => {
+        }
+    }
+}
+
+// Matching without binding anything takes nothing, so the option keeps its payload and destroys it itself.
+func MatchWithoutBinding(held: Option<Tracked>) {
+    match held {
+        .Some(_) => {
+        },
+        .None => {
+        }
+    }
+}
+
+// Matching through a borrow takes nothing either: the option belongs to somebody else and still owns its payload.
+func MatchThroughBorrow(held: &Option<Tracked>) -> bool {
+    match held {
+        .Some(value) => {
+            return true;
+        },
+        .None => {
+            return false;
+        }
+    }
+}
+
+func MakeTracked(counter: *var Counter) -> Tracked {
+    return Tracked { counter: counter };
+}
+
+// A value that reaches the end of its scope is destroyed there.
+func ScopeExit(counter: *var Counter) {
+    let tracked = MakeTracked(counter);
+}
+
+// A value handed to another binding has one owner, so it is destroyed once.
+func MoveToBinding(counter: *var Counter) {
+    let first = MakeTracked(counter);
+    let second <- first;
+}
+
+// A value returned to the caller is not destroyed in the callee.
+func MoveOut(counter: *var Counter) -> Tracked {
+    let tracked = MakeTracked(counter);
+    return <-tracked;
+}
+
+// A value moved away on one path only: the flag, not the source text, decides whether the scope destroys it.
+func ConditionalMove(counter: *var Counter, away: bool) {
+    let tracked = MakeTracked(counter);
+    if away {
+        let taken <- tracked;
+        return;
+    }
+}
+
+// Every field of an aggregate is destroyed with it.
+func NestedFields(counter: *var Counter) {
+    let pair = Pair { first: MakeTracked(counter), second: MakeTracked(counter) };
+}
+
+// A value left behind by an assignment is destroyed before the new one takes its place.
+func Overwrite(counter: *var Counter) {
+    var tracked = MakeTracked(counter);
+    tracked <- MakeTracked(counter);
+}
+
+// Every element of an array is destroyed, and the array's own length is what says how many.
+func ArrayElements(counter: *var Counter) {
+    let tracked: Tracked[3] = [MakeTracked(counter), MakeTracked(counter), MakeTracked(counter)];
+}
+
+// The payload an option carries is destroyed with it; the empty case has nothing to destroy.
+func OptionPayload(counter: *var Counter, carried: bool) {
+    if carried {
+        let held = Option::Some<Tracked>(MakeTracked(counter));
+        return;
+    }
+    let empty = Option::None<Tracked>();
+}
+
+func Main() -> int {
+    var counter = Counter { count: 0 };
+
+    ScopeExit(@counter);
+    Assert(counter.count == 1, "a value is destroyed when its scope ends");
+
+    counter.count = 0;
+    MoveToBinding(@counter);
+    Assert(counter.count == 1, "a value handed to another binding is destroyed once");
+
+    counter.count = 0;
+    let returned = MoveOut(@counter);
+    Assert(counter.count == 0, "a returned value is not destroyed by the callee");
+
+    counter.count = 0;
+    ConditionalMove(@counter, true);
+    Assert(counter.count == 1, "a value moved away on a taken path is destroyed once");
+
+    counter.count = 0;
+    ConditionalMove(@counter, false);
+    Assert(counter.count == 1, "a value the taken path never moved is destroyed at scope exit");
+
+    counter.count = 0;
+    NestedFields(@counter);
+    Assert(counter.count == 2, "every field of an aggregate is destroyed with it");
+
+    counter.count = 0;
+    Overwrite(@counter);
+    Assert(counter.count == 2, "an overwritten value and its replacement are both destroyed");
+
+    counter.count = 0;
+    ArrayElements(@counter);
+    Assert(counter.count == 3, "every element of an array is destroyed with it");
+
+    counter.count = 0;
+    OptionPayload(@counter, true);
+    Assert(counter.count == 1, "the value an option carries is destroyed with the option");
+
+    counter.count = 0;
+    OptionPayload(@counter, false);
+    Assert(counter.count == 0, "an empty option has nothing to destroy");
+
+    // Handing a value to a generic moves it in rather than copying it, so the caller's value is not destroyed behind
+    // the callee's back. Whether that store consumes depends on what the parameter stands for, which is known only
+    // at the instantiation -- and a container that kept a copy while the source was destroyed would be holding
+    // something whose storage had already gone.
+    counter.count = 0;
+    var room = Tracked { counter: @counter };
+    PutThroughGeneric<Tracked>(@room, MakeTracked(@counter));
+    Assert(counter.count == 0, "a generic function's stored parameter is moved rather than copied and destroyed");
+
+    counter.count = 0;
+    var second = Tracked { counter: @counter };
+    var holder = Holder<Tracked> { slot: @second, filled: false };
+    holder.Put(MakeTracked(@counter));
+    Assert(counter.count == 0, "and so is a generic type's method parameter");
+    Assert(holder.filled, "which the method still recorded having stored");
+
+    // A match that binds part of its subject takes that part: the arm owns it and destroys it once. The subject is
+    // not destroyed as well, which would be twice, and the payload is not left to nobody, which would be never.
+    counter.count = 0;
+    MatchAndDiscard(Option::Some<Tracked>(MakeTracked(@counter)));
+    Assert(counter.count == 1, "a payload bound by an arm is destroyed once, when the arm ends");
+
+    // A match that binds nothing takes nothing, so the option keeps its payload and destroys it itself.
+    counter.count = 0;
+    MatchWithoutBinding(Option::Some<Tracked>(MakeTracked(@counter)));
+    Assert(counter.count == 1, "and an option nothing was taken from destroys its own payload");
+
+    // A match through a borrow takes nothing either. The option is somebody else's and still owns what it holds.
+    counter.count = 0;
+    var borrowed = Option::Some<Tracked>(MakeTracked(@counter));
+    Assert(MatchThroughBorrow(borrowed), "a borrowed option can be looked at");
+    Assert(counter.count == 0, "and looking at one destroys nothing");
+
+    // An option whose payload is an aggregate destroys the aggregate's fields where they are. The payload address is
+    // reached by counting bytes, and a byte address has no fields to offset from, so every field was destroyed at
+    // the front of the payload -- correct only when the field that needed destroying happened to sit first.
+    counter.count = 0;
+    HoldEntry(@counter);
+    Assert(counter.count == 1, "a field behind another in an option's payload is destroyed once, where it is");
+
+    counter.count = 0;
+    HoldNested(@counter);
+    Assert(counter.count == 2, "and so is every field of a payload holding more than one");
+
+    return 0;
+}

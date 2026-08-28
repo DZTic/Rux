@@ -1,0 +1,119 @@
+// The named parts of a path, and the joins and simplifications that stay lexical.
+//
+// Everything here reads units and produces views into them or fresh buffers from them; nothing asks the
+// filesystem anything. That matters most for `Normalize`: it resolves `..` by dropping the segment before it,
+// which is the truth about directories and a lie about symbolic links -- `a/link/..` need not be `a` when `link`
+// points elsewhere. The lie is documented, deliberate, and cheap; the truth costs a filesystem and arrives with
+// canonicalization in the S tasks.
+
+import Core::{ Option, Slice };
+
+extend Path {
+    /// This path without its last component, or `None` where nothing is left to remove.
+    ///
+    /// The parent of `/a` is `/`, and the root's parent is `None`: the root is not inside anything. The parent of
+    /// a bare segment is the empty path, which is what lets a loop walk parents to a fixed end.
+    ///
+    /// https://rux-lang.dev/docs/api/path/path/parent
+    pub func Parent(self: &Path) -> Option<Path> {
+        let units = self.name.Units();
+        var end = units.length;
+        // Trailing separators say nothing about parenthood.
+        while end > 1 && IsSeparator(units.data[end - 1]) {
+            end = end - 1;
+        }
+        if end == 0 {
+            return Option::None<Path>();
+        }
+        if end == 1 && IsSeparator(units.data[0]) {
+            return Option::None<Path>();
+        }
+        // Walk back over the last segment, then over the separators before it -- keeping the one that is the root.
+        while end > 0 && !IsSeparator(units.data[end - 1]) {
+            end = end - 1;
+        }
+        while end > 1 && IsSeparator(units.data[end - 1]) {
+            end = end - 1;
+        }
+        let kept = Slice<OsUnit> { data: units.data, length: end };
+        return Option::Some<Path>(Path::FromView(OsStringView::FromUnits(kept)));
+    }
+
+    /// The last component's name, or `None` for the empty path and the root.
+    ///
+    /// Trailing separators are ignored: `a/b/` names `b`, because that is what everything from shells to
+    /// libraries has always meant by it.
+    ///
+    /// https://rux-lang.dev/docs/api/path/path/file-name
+    pub func FileName(self: &Path) -> Option<OsStringView> {
+        let units = self.name.Units();
+        var end = units.length;
+        while end > 0 && IsSeparator(units.data[end - 1]) {
+            end = end - 1;
+        }
+        if end == 0 {
+            return Option::None<OsStringView>();
+        }
+        var start = end;
+        while start > 0 && !IsSeparator(units.data[start - 1]) {
+            start = start - 1;
+        }
+        let name = Slice<OsUnit> { data: @units.data[start], length: end - start };
+        return Option::Some<OsStringView>(OsStringView::FromUnits(name));
+    }
+
+    /// The file name before its extension, or `None` where there is no file name.
+    ///
+    /// A leading dot is part of the name, not an extension marker: the stem of `.bashrc` is `.bashrc`. Of
+    /// `a.tar.gz` it is `a.tar` -- one extension comes off, the last.
+    ///
+    /// https://rux-lang.dev/docs/api/path/path/stem
+    pub func Stem(self: &Path) -> Option<OsStringView> {
+        let name = self.FileName();
+        if name.IsNone() {
+            return Option::None<OsStringView>();
+        }
+        let whole = name.ValueOr(OsStringView());
+        let units = whole.Units();
+        let cut = LastDot(units);
+        if cut == 0 || cut >= units.length {
+            return Option::Some<OsStringView>(whole);
+        }
+        let kept = Slice<OsUnit> { data: units.data, length: cut };
+        return Option::Some<OsStringView>(OsStringView::FromUnits(kept));
+    }
+
+    /// The extension after the last dot, without the dot, or `None` where there is none.
+    ///
+    /// `None` for `.bashrc` and for `Makefile` alike: a name that is all extension has none.
+    ///
+    /// https://rux-lang.dev/docs/api/path/path/extension
+    pub func Extension(self: &Path) -> Option<OsStringView> {
+        let name = self.FileName();
+        if name.IsNone() {
+            return Option::None<OsStringView>();
+        }
+        let whole = name.ValueOr(OsStringView());
+        let units = whole.Units();
+        let cut = LastDot(units);
+        if cut == 0 || cut >= units.length {
+            return Option::None<OsStringView>();
+        }
+        let kept = Slice<OsUnit> { data: @units.data[cut + 1], length: units.length - cut - 1 };
+        return Option::Some<OsStringView>(OsStringView::FromUnits(kept));
+    }
+}
+
+// The index of the last dot that marks an extension: past position zero, so a leading dot is a name. The length
+// stands for "no dot".
+func LastDot(units: Slice<OsUnit>) -> uint {
+    var index = units.length;
+    while index > 1 {
+        index = index - 1;
+        let dot = units.data[index] as uint32;
+        if dot == 0x2E {
+            return index;
+        }
+    }
+    return units.length;
+}

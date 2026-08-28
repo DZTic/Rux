@@ -2,19 +2,15 @@
 
 #include "Package/Manifest.h"
 
-#include <algorithm>
-#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <print>
-#include <ranges>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Rux {
 namespace fs = std::filesystem;
-using ScaffoldResult = std::expected<void, std::string>;
 
 /**
  * @brief Writes a file with the given content.
@@ -25,73 +21,155 @@ using ScaffoldResult = std::expected<void, std::string>;
  * @param path Output file path
  * @param content File content
  * @param skipIfExists Whether to skip writing if file already exists
- * @return std::expected<void, std::string> error message on failure
+ * @return A structured error on failure, otherwise no value
  */
-static ScaffoldResult WriteFile(const fs::path &path, const std::string_view content, const bool skipIfExists) {
-    if (skipIfExists && fs::exists(path)) {
-        return {};
+static std::optional<ScaffoldError> WriteFile(const fs::path &path, const std::string_view content,
+                                              const bool skipIfExists, ScaffoldChanges &changes) {
+    std::error_code existsError;
+    const bool exists = fs::exists(path, existsError);
+    if (existsError) {
+        return ScaffoldError{ScaffoldErrorKind::WriteFile, path, existsError.message(), changes};
+    }
+    if (skipIfExists && exists) {
+        std::error_code typeError;
+        const bool regularFile = fs::is_regular_file(path, typeError);
+        if (typeError) {
+            return ScaffoldError{ScaffoldErrorKind::WriteFile, path, typeError.message(), changes};
+        }
+        if (!regularFile) {
+            return ScaffoldError{ScaffoldErrorKind::WriteFile, path, "the path exists but is not a regular file",
+                                 changes};
+        }
+        ++changes.filesPreserved;
+        return std::nullopt;
     }
 
     if (std::ofstream f{path, std::ios::binary}; f.write(content.data(), content.size())) {
-        return {};
+        ++changes.filesWritten;
+        return std::nullopt;
     }
-    return std::unexpected(std::format("failed to write file: {}", path.string()));
+    return ScaffoldError{ScaffoldErrorKind::WriteFile, path, "the file could not be opened or written", changes};
 }
 
 /**
  * @brief Creates a directory tree.
  *
  * @param path Directory path to create
- * @return std::expected<void, std::string> error message on failure
+ * @return A structured error on failure, otherwise no value
  */
-static ScaffoldResult MakeDir(const fs::path &path) {
-    if (std::error_code ec; fs::create_directories(path, ec) || !ec) {
-        return {};
+static std::optional<ScaffoldError> MakeDir(const fs::path &path, ScaffoldChanges &changes) {
+    std::error_code error;
+    const bool created = fs::create_directories(path, error);
+    if (error) {
+        return ScaffoldError{ScaffoldErrorKind::CreateDirectory, path, error.message(), changes};
     }
-    return std::unexpected(std::format("failed to create directory: {}", path.string()));
+    changes.directoryTreesCreated += static_cast<std::size_t>(created);
+    return std::nullopt;
 }
 
-bool ScaffoldPackage(const fs::path &root, const std::string &name, const PackageType type, const bool initMode) {
-    if (!initMode && fs::exists(root)) {
-        std::println(stderr, "error: directory '{}' already exists", root.string());
-        return false;
+/**
+ * @brief Names the starter source file for a package kind.
+ *
+ * Only an Executable carries an entry point, so it alone gets Main.rux. Library
+ * packages expose a module instead.
+ */
+static std::string_view StarterFileName(const ManifestPackageType type) {
+    return type == ManifestPackageType::Executable ? "Main.rux" : "Lib.rux";
+}
+
+/**
+ * @brief Starter source matching the package kind.
+ */
+static std::string StarterSource(const ManifestPackageType type, const std::string &name) {
+    if (type == ManifestPackageType::Executable) {
+        return "func Main() -> int {\n    return 0;\n}\n";
+    }
+    return std::format("module {} {{\n}}\n", name);
+}
+
+ScaffoldResult ScaffoldPackage(const ScaffoldOptions &options) {
+    const fs::path &root = options.root;
+
+    // Validate the identity before touching the filesystem, so a rejected name
+    // leaves no half-created package behind.
+    const auto packageName = IdentitySegment::Parse(options.name);
+    if (!packageName) {
+        return std::unexpected(ScaffoldError{ScaffoldErrorKind::InvalidName, {}, Describe(packageName.error()), {}});
     }
 
-    auto run_task = [](auto &&task_result) -> bool {
-        if (!task_result) {
-            std::println(stderr, "error: {}", task_result.error());
-            return false;
+    std::error_code existsError;
+    const bool rootExists = fs::exists(root, existsError);
+    if (existsError) {
+        return std::unexpected(ScaffoldError{ScaffoldErrorKind::CreateDirectory, root, existsError.message(), {}});
+    }
+    if (!options.initMode && rootExists) {
+        return std::unexpected(ScaffoldError{ScaffoldErrorKind::ExistingDestination, root, {}, {}});
+    }
+
+    ScaffoldChanges changes;
+
+    // A SourceLibrary package produces no artifact of its own, so it needs no output
+    // directories; it is compiled into whichever package depends on it.
+    std::vector dirs = {root / "Src", root / "Temp"};
+    if (options.type != ManifestPackageType::SourceLibrary) {
+        dirs.insert(dirs.begin(), root / "Bin");
+    }
+    for (const auto &directory : dirs) {
+        if (auto error = MakeDir(directory, changes)) {
+            return std::unexpected(std::move(*error));
         }
-        return true;
-    };
-
-    if (const std::vector dirs = {root / "Bin/Debug", root / "Bin/Release", root / "Src", root / "Temp"};
-        !std::ranges::all_of(dirs, [&](const auto &p) { return run_task(MakeDir(p)); })) {
-        return false;
     }
 
-    if (const auto tomlPath = root / "Rux.toml"; !initMode || !fs::exists(tomlPath)) {
+    const auto tomlPath = root / "Rux.toml";
+    std::error_code manifestExistsError;
+    const bool manifestExists = fs::exists(tomlPath, manifestExistsError);
+    if (manifestExistsError) {
+        return std::unexpected(
+            ScaffoldError{ScaffoldErrorKind::WriteFile, tomlPath, manifestExistsError.message(), changes});
+    }
+    if (options.initMode && manifestExists) {
+        std::error_code manifestTypeError;
+        const bool regularManifest = fs::is_regular_file(tomlPath, manifestTypeError);
+        if (manifestTypeError) {
+            return std::unexpected(
+                ScaffoldError{ScaffoldErrorKind::WriteFile, tomlPath, manifestTypeError.message(), changes});
+        }
+        if (!regularManifest) {
+            return std::unexpected(ScaffoldError{ScaffoldErrorKind::WriteFile, tomlPath,
+                                                 "the path exists but is not a regular file", changes});
+        }
+    }
+    if (!options.initMode || !manifestExists) {
         Manifest m;
-        m.package.name = name;
-        m.package.version = "0.1.0";
-        m.package.type = (type == PackageType::Executable ? "bin" : "lib");
+        m.package.ns = options.ns;
+        m.package.name = *packageName;
+        m.package.version = *SemanticVersion::Parse("0.1.0");
+        m.package.type = options.type;
         if (!m.Save(tomlPath)) {
-            std::println(stderr, "error: cannot write Rux.toml");
-            return false;
+            return std::unexpected(ScaffoldError{ScaffoldErrorKind::WriteFile, tomlPath,
+                                                 "the manifest could not be opened or written", changes});
         }
+        ++changes.filesWritten;
+    }
+    else {
+        ++changes.filesPreserved;
     }
 
-    const bool isBin = (type == PackageType::Executable);
-    const std::string_view srcContent = isBin ? "func Main() -> int {\n    return 0;\n}\n" : "// Library\n";
+    const std::string srcContent = StarterSource(options.type, packageName->Text());
 
     struct FileTask {
         fs::path path;
         std::string_view content;
     };
 
-    const FileTask tasks[] = {{root / "Src" / (isBin ? "Main.rux" : "Lib.rux"), srcContent},
+    const FileTask tasks[] = {{root / "Src" / StarterFileName(options.type), srcContent},
                               {root / ".gitignore", "# Rux build outputs\nBin/\nTemp/\n"}};
 
-    return std::ranges::all_of(tasks, [&](const auto &t) { return run_task(WriteFile(t.path, t.content, initMode)); });
+    for (const auto &task : tasks) {
+        if (auto error = WriteFile(task.path, task.content, options.initMode, changes)) {
+            return std::unexpected(std::move(*error));
+        }
+    }
+    return changes;
 }
 } // namespace Rux

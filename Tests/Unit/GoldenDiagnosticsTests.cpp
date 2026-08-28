@@ -3,11 +3,20 @@
 // Every Tests/Unit/Golden/<Case>.rux file is compiled through the frontend
 // (lex -> parse -> sema, mirroring `rux check`), its diagnostics are rendered
 // one per line as "line:column: severity: message", and the result is compared
-// against the sibling <Case>.expected file.
+// against the sibling <Case>.expected file. Supplemental notes, help and docs
+// are deliberately excluded: these files pin only the stable primary line.
+//
+// A case compiled for AArch64 goes one stage further: every `asm func` a clean
+// frontend leaves behind is handed to the AArch64 assembler, so a case can pin
+// what an inline body reports. That assembler is the one with no route through
+// the driver yet — the x86-64 one already reports through `rux build` — so a
+// golden case is the only place its diagnostics can be read as a body's author
+// would see them.
 //
 // To (re)generate the expected files after an intentional diagnostics change,
 // run the test binary with RUX_UPDATE_GOLDEN=1 and review the diff.
 
+#include "CodeGen/AArch64/Assembler.h"
 #include "Diagnostics/Diagnostics.h"
 #include "Driver/BuildTarget.h"
 #include "Lexer/Lexer.h"
@@ -16,6 +25,8 @@
 #include "System/Os.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <doctest.h>
 #include <filesystem>
 #include <format>
@@ -54,10 +65,31 @@ void AppendDiagnostics(std::string &out, std::span<const Diagnostic> diags) {
     }
 }
 
+// The target a case is compiled for. A case that says nothing is compiled for
+// the host, which is what every case about the language rather than the
+// machine wants; one that opens with `// rux:target <triple>` names its own,
+// so a diagnostic about a foreign target can be asserted from any host.
+std::string CaseTarget(const std::string &source) {
+    static constexpr std::string_view directive = "// rux:target ";
+    if (source.starts_with(directive)) {
+        const auto end = source.find('\n');
+        std::string triple = source.substr(directive.size(), end - directive.size());
+        while (!triple.empty() && (triple.back() == ' ' || triple.back() == '\t')) {
+            triple.pop_back();
+        }
+        return triple;
+    }
+    return Driver::HostTargetTriple();
+}
+
 // Run the frontend over one in-memory source file and render its diagnostics.
 // Later stages only run when the earlier ones are clean, mirroring the driver.
 std::string FrontendDiagnostics(std::string source, const std::string &sourceName) {
     std::string out;
+
+    CompileTimeContext context;
+    context.targetTriple = CaseTarget(source);
+    context.target = Driver::TargetContextForTriple(*Target::TargetTriple::Parse(context.targetTriple));
 
     Lexer lexer(std::move(source), sourceName);
     auto lexResult = lexer.Tokenize();
@@ -66,21 +98,50 @@ std::string FrontendDiagnostics(std::string source, const std::string &sourceNam
         return out;
     }
 
-    Parser parser(std::move(lexResult.tokens), sourceName);
+    Parser parser(std::move(lexResult.tokens), sourceName, context.target.arch);
     auto parseResult = parser.Parse();
     AppendDiagnostics(out, parseResult.diagnostics);
     if (parseResult.HasErrors()) {
         return out;
     }
 
-    SemanticAnalyzer analyzer({&parseResult.module}, {}, "Golden",
-                              std::string(Driver::TargetOsName(Driver::HostTargetTriple())));
+    SemanticAnalyzer analyzer({&parseResult.module}, {}, "Golden", context);
     const auto semaResult = analyzer.Analyze();
     AppendDiagnostics(out, semaResult.diagnostics);
+    if (semaResult.HasErrors() || context.target.arch != Target::Arch::AArch64) {
+        return out;
+    }
+
+    // Assemble what the frontend accepted. An `asm func` body is machine code
+    // the moment it parses, so its mistakes are the assembler's to report.
+    for (const auto &item : parseResult.module.items) {
+        const auto *func = dynamic_cast<const FuncDecl *>(item.get());
+        if (func == nullptr || !func->isAsm) {
+            continue;
+        }
+        std::vector<std::uint8_t> code;
+        const AsmAssembly assembled = AssembleAArch64AsmFunc(func->asmBody, sourceName, code);
+        AppendDiagnostics(out, assembled.diagnostics);
+    }
     return out;
 }
 
 } // namespace
+
+TEST_CASE("Golden inspection serialization omits supplemental human context and source frames") {
+    Diagnostic diagnostic{
+        Diagnostic::Severity::Error, "Case.rux", {.line = 4, .column = 2}, "primary message", {}, {}, {}};
+    diagnostic.notes = {"supporting note"};
+    diagnostic.help = "corrective help";
+    diagnostic.documentationUrl = "https://example.invalid/docs";
+
+    std::string output;
+    AppendDiagnostics(output, std::array{diagnostic});
+    CHECK(output == "4:2: error: primary message\n");
+    CHECK_FALSE(output.contains("Case.rux"));
+    CHECK_FALSE(output.contains('|'));
+    CHECK_FALSE(output.contains('^'));
+}
 
 TEST_CASE("Golden diagnostics match the expected files") {
     const std::filesystem::path goldenDir = RUX_GOLDEN_DIR;

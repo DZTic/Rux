@@ -1,12 +1,15 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "Float64"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Package test for Format: Float64"
 
 [Dependencies]
+Core = { Path = "../../../../Packages/Core" }
 Format = { Path = "../../../../Packages/Format" }
-Rux = { Path = "../../../../Packages/Rux" }
 Text = { Path = "../../../../Packages/Text" }
 
 [Build]

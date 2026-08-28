@@ -1,10 +1,13 @@
 // PE32+ object writer and Windows DLL import resolution.
 
+#include "Linker/AArch64Relocation.h"
 #include "Linker/Linker.h"
 #include "Linker/LinkerInternal.h"
+#include "Linker/RcuObjectLayout.h"
 #include "System/Os.h"
 
 #include <algorithm>
+#include <format>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -19,26 +22,297 @@ namespace Rux {
 [[maybe_unused]] static constexpr uint64_t kImageBase = 0x1'4000'0000ULL;
 [[maybe_unused]] static constexpr uint32_t kSecAlign = 0x1000; // 4 KB section alignment
 [[maybe_unused]] static constexpr uint32_t kFileAlign = 0x200; // 512 B file alignment
-[[maybe_unused]] static constexpr uint16_t kMachineAmd64 = 0x8664;
 [[maybe_unused]] static constexpr uint16_t kMagicPE32P = 0x020B;
 [[maybe_unused]] static constexpr uint16_t kSubsystemCUI = 3; // console
 
 // DLL-specific
 [[maybe_unused]] static constexpr uint16_t kSubsystemGUI = 2; // windows GUI (used for DLLs)
-// IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE |
-// IMAGE_FILE_DLL
+/// IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE. The .reloc table below describes every absolute fixup,
+/// so IMAGE_FILE_RELOCS_STRIPPED must stay clear: the ARM64 loader refuses an image it cannot relocate with "%1 is not
+/// a valid Win32 application".
+[[maybe_unused]] static constexpr uint16_t kCharacteristicsExecutable = 0x0022u;
+/// The same flags plus IMAGE_FILE_DLL.
 [[maybe_unused]] static constexpr uint16_t kCharacteristicsDll = 0x2022u;
 
 // IMAGE_SCN_ characteristics
 [[maybe_unused]] static constexpr uint32_t kScnText = 0x6000'0020u;  // CNT_CODE | MEM_EXECUTE | MEM_READ
 [[maybe_unused]] static constexpr uint32_t kScnRData = 0x4000'0040u; // CNT_INITIALIZED_DATA | MEM_READ
 [[maybe_unused]] static constexpr uint32_t kScnData = 0xC000'0040u;  // CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
+/// CNT_INITIALIZED_DATA | MEM_DISCARDABLE | MEM_READ — the loader reads .reloc once while mapping and never needs it
+/// again.
+[[maybe_unused]] static constexpr uint32_t kScnReloc = 0x4200'0040u;
 
-// DllCharacteristics: NX_COMPAT | TERMINAL_SERVER_AWARE.
-// The linker currently does not emit a .reloc table, so do not opt into
-// ASLR. Absolute relocations such as vtable function pointers must remain
-// valid at the preferred image base.
-[[maybe_unused]] static constexpr uint16_t kDllChars = 0x8100u;
+/// DllCharacteristics: HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE. The .reloc table lets the
+/// loader place the image anywhere, and Windows on ARM64 only loads images that opt into ASLR.
+[[maybe_unused]] static constexpr uint16_t kDllChars = 0x8160u;
+
+struct PeStubPatch {
+    size_t stubOffset = 0;
+    size_t fieldOffset = 0;
+    uint16_t type = RcuRelType::Rel32;
+};
+
+struct PeImportThunk {
+    size_t stubOffset = 0;
+    std::vector<PeStubPatch> patches;
+};
+
+struct PeMissingEntryPatch {
+    size_t offset = 0;
+    Buf bytes;
+};
+
+struct PeStubs {
+    Buf bytes;
+    PeStubPatch userEntry;
+    std::optional<PeStubPatch> exitProcess;
+    std::vector<PeImportThunk> imports;
+    std::optional<PeMissingEntryPatch> missingDllEntry;
+};
+
+using BuildPeEntryStub = PeStubs (*)(bool);
+using AppendPeImportThunk = void (*)(PeStubs &);
+using ApplyPeRelocation = bool (*)(Buf &, size_t, uint64_t, uint64_t, int64_t, uint16_t, std::string_view,
+                                   std::string &);
+
+struct PeArchitectureConfig {
+    uint16_t machine = 0;
+    uint8_t codePadding = 0;
+    // Operating-system and subsystem version stamped into the image, matching
+    // the platform linker's default for the machine. The values are load
+    // gates, not documentation: the ARM64 loader terminates a process whose
+    // image claims a version other than 6.2 (verified on Windows 11 ARM64 —
+    // 10.0 dies during initialization with STATUS_INVALID_IMAGE_FORMAT, and
+    // anything below 6.2 is rejected outright).
+    uint16_t minimumOsVersionMajor = 0;
+    uint16_t minimumOsVersionMinor = 0;
+    BuildPeEntryStub buildEntryStub = nullptr;
+    AppendPeImportThunk appendImportThunk = nullptr;
+    ApplyPeRelocation applyRelocation = nullptr;
+};
+
+static PeStubs BuildX86_64EntryStub(const bool isDll) {
+    PeStubs stubs;
+    if (isDll) {
+        // sub rsp, 0x28; call DllMain; add rsp, 0x28; ret
+        stubs.bytes.insert(stubs.bytes.end(), {0x48, 0x83, 0xEC, 0x28, 0xE8, 0, 0, 0, 0, 0x48, 0x83, 0xC4, 0x28, 0xC3});
+        stubs.userEntry = {0, 5, RcuRelType::Rel32};
+        stubs.missingDllEntry = PeMissingEntryPatch{4, {0xB8, 1, 0, 0, 0}}; // mov eax, TRUE
+    }
+    else {
+        // sub rsp, 0x28; call Main; mov ecx, eax; call ExitProcess; int3
+        stubs.bytes.insert(stubs.bytes.end(),
+                           {0x48, 0x83, 0xEC, 0x28, 0xE8, 0, 0, 0, 0, 0x89, 0xC1, 0xE8, 0, 0, 0, 0, 0xCC});
+        stubs.userEntry = {0, 5, RcuRelType::Rel32};
+        stubs.exitProcess = PeStubPatch{0, 12, RcuRelType::Rel32};
+    }
+
+    return stubs;
+}
+
+static void AppendX86_64ImportThunk(PeStubs &stubs) {
+    const size_t offset = stubs.bytes.size();
+    stubs.bytes.insert(stubs.bytes.end(), {0xFF, 0x25, 0, 0, 0, 0}); // jmp qword ptr [rip+disp32]
+    stubs.imports.push_back({offset, {{offset, offset + 2, RcuRelType::Rel32}}});
+}
+
+static bool ApplyX86_64PeRelocation(Buf &buffer, const size_t patchAt, const uint64_t siteVa, const uint64_t targetVa,
+                                    const int64_t addend, const uint16_t type, const std::string_view symbolName,
+                                    std::string &error) {
+    uint64_t value = 0;
+    if (!AddSignedAddress(targetVa, addend, value)) {
+        error = std::format("relocation to '{}' overflows the 64-bit target address", symbolName);
+        return false;
+    }
+    if (type == RcuRelType::Rel32) {
+        if (patchAt + 4 > buffer.size()) {
+            return false;
+        }
+        int64_t displacement = 0;
+        if (!SignedAddressDelta(value, siteVa + 4, displacement) ||
+            displacement < std::numeric_limits<int32_t>::min() || displacement > std::numeric_limits<int32_t>::max()) {
+            error = std::format("x86-64 PC-relative relocation to '{}' is out of range", symbolName);
+            return false;
+        }
+        Patch32(buffer, patchAt, static_cast<uint32_t>(static_cast<int32_t>(displacement)));
+        return true;
+    }
+    if (type == RcuRelType::Abs64) {
+        if (patchAt + 8 > buffer.size()) {
+            return false;
+        }
+        Patch64(buffer, patchAt, value);
+        return true;
+    }
+    if (type == RcuRelType::Abs32) {
+        if (patchAt + 4 > buffer.size()) {
+            return false;
+        }
+        if (value > std::numeric_limits<uint32_t>::max()) {
+            error = std::format("ABS_32 relocation to '{}' does not fit in 32 bits", symbolName);
+            return false;
+        }
+        Patch32(buffer, patchAt, static_cast<uint32_t>(value));
+        return true;
+    }
+    error = std::format("relocation {} against '{}' is not supported by the PE32+ writer", RcuRelTypeName(type),
+                        symbolName);
+    return false;
+}
+
+static PeStubs BuildAArch64EntryStub(const bool isDll) {
+    PeStubs stubs;
+    if (isDll) {
+        // stp x29, x30, [sp, #-16]!; mov x29, sp; bl DllMain;
+        // ldp x29, x30, [sp], #16; ret
+        //
+        // The loader's x0-x2 arguments reach DllMain untouched. The frame
+        // saves the loader's return address across BL and keeps SP aligned.
+        for (const uint32_t word : {0xA9BF7BFDu, 0x910003FDu, 0x94000000u, 0xA8C17BFDu, 0xD65F03C0u}) {
+            WriteU32(stubs.bytes, word);
+        }
+        stubs.userEntry = {0, 8, RcuRelType::AArch64Call26};
+
+        Buf returnTrue;
+        WriteU32(returnTrue, 0x52800020u); // mov w0, #TRUE
+        stubs.missingDllEntry = PeMissingEntryPatch{8, std::move(returnTrue)};
+        return stubs;
+    }
+
+    // stp x29, x30, [sp, #-16]!; mov x29, sp; bl Main; bl ExitProcess; brk #0
+    // The loader supplies a 16-byte-aligned SP. Preserve that alignment and a
+    // conventional frame chain, leave Main's result in w0 for ExitProcess,
+    // and trap if the no-return import unexpectedly returns.
+    for (const uint32_t word : {0xA9BF7BFDu, 0x910003FDu, 0x94000000u, 0x94000000u, 0xD4200000u}) {
+        WriteU32(stubs.bytes, word);
+    }
+    stubs.userEntry = {0, 8, RcuRelType::AArch64Call26};
+    stubs.exitProcess = PeStubPatch{0, 12, RcuRelType::AArch64Call26};
+    return stubs;
+}
+
+static void AppendAArch64ImportThunk(PeStubs &stubs) {
+    const size_t offset = stubs.bytes.size();
+    // adrp x16, IAT-page; ldr x16, [x16, IAT-pageoff]; br x16
+    // x16 is AAPCS64's intra-procedure-call scratch register, so the thunk
+    // leaves x0-x7 (and therefore every argument register) untouched.
+    for (const uint32_t word : {0x90000010u, 0xF9400210u, 0xD61F0200u}) {
+        WriteU32(stubs.bytes, word);
+    }
+    stubs.imports.push_back(
+        {offset,
+         {{offset, offset, RcuRelType::AArch64AdrPrelPgHi21}, {offset, offset + 4, RcuRelType::AArch64LdstAbsLo12Nc}}});
+}
+
+static bool ApplyAArch64PeRelocation(Buf &buffer, const size_t patchAt, const uint64_t siteVa, const uint64_t targetVa,
+                                     const int64_t addend, const uint16_t type, const std::string_view symbolName,
+                                     std::string &error) {
+    const size_t width = type == RcuRelType::Abs64 || type == RcuRelType::AArch64Prel64 ? 8 : 4;
+    if (patchAt > buffer.size() || width > buffer.size() - patchAt) {
+        error = std::format("{} relocation against '{}' has a patch outside its PE section", RcuRelTypeName(type),
+                            symbolName);
+        return false;
+    }
+    return ApplyAArch64Relocation(buffer, patchAt, type, targetVa, addend, siteVa, symbolName, "PE32+ writer", error);
+}
+
+static const PeArchitectureConfig *PeArchitectureFor(const Target::Arch arch) {
+    static constexpr PeArchitectureConfig x86_64{
+        .machine = 0x8664, // IMAGE_FILE_MACHINE_AMD64
+        .codePadding = 0xCC,
+        .minimumOsVersionMajor = 6, // Windows Vista
+        .minimumOsVersionMinor = 0,
+        .buildEntryStub = BuildX86_64EntryStub,
+        .appendImportThunk = AppendX86_64ImportThunk,
+        .applyRelocation = ApplyX86_64PeRelocation,
+    };
+    static constexpr PeArchitectureConfig aarch64{
+        .machine = 0xAA64, // IMAGE_FILE_MACHINE_ARM64
+        .codePadding = 0,
+        .minimumOsVersionMajor = 6, // 6.2, the Windows ARM64 toolchain baseline
+        .minimumOsVersionMinor = 2,
+        .buildEntryStub = BuildAArch64EntryStub,
+        .appendImportThunk = AppendAArch64ImportThunk,
+        .applyRelocation = ApplyAArch64PeRelocation,
+    };
+    switch (arch) {
+    case Target::Arch::X86_64:
+        return &x86_64;
+    case Target::Arch::AArch64:
+        return &aarch64;
+    default:
+        return nullptr;
+    }
+}
+
+static PeStubs BuildPeStubs(const PeArchitectureConfig &architecture, const bool isDll, const size_t importCount) {
+    PeStubs stubs = architecture.buildEntryStub(isDll);
+    stubs.imports.reserve(importCount);
+    for (size_t i = 0; i < importCount; ++i) {
+        architecture.appendImportThunk(stubs);
+    }
+    return stubs;
+}
+
+static bool PatchPeStubs(const PeArchitectureConfig &architecture, const PeStubs &stubs, Buf &text,
+                         const uint64_t textVa, const uint64_t rdataVa, const std::vector<uint32_t> &iatEntryOffsets,
+                         const std::vector<std::string> &importNames,
+                         const std::unordered_map<std::string, size_t> &importIndexes,
+                         const std::optional<uint64_t> entry, const bool isDll, std::string &error) {
+    for (size_t i = 0; i < stubs.imports.size(); ++i) {
+        for (const auto &patch : stubs.imports[i].patches) {
+            if (!architecture.applyRelocation(text, patch.fieldOffset, textVa + patch.fieldOffset,
+                                              rdataVa + iatEntryOffsets[i], 0, patch.type, importNames[i], error)) {
+                return false;
+            }
+        }
+    }
+
+    const std::string_view entryName = isDll ? "DllMain" : "Main";
+    if (entry) {
+        const auto &patch = stubs.userEntry;
+        if (!architecture.applyRelocation(text, patch.fieldOffset, textVa + patch.fieldOffset, *entry, 0, patch.type,
+                                          entryName, error)) {
+            return false;
+        }
+    }
+    else if (stubs.missingDllEntry) {
+        const auto &replacement = *stubs.missingDllEntry;
+        std::ranges::copy(replacement.bytes, text.begin() + static_cast<std::ptrdiff_t>(replacement.offset));
+    }
+    else {
+        error = "undefined symbol 'Main' — no entry point found";
+        return false;
+    }
+
+    if (stubs.exitProcess) {
+        const auto exitIndex = importIndexes.find("ExitProcess");
+        if (exitIndex == importIndexes.end()) {
+            error = "internal: ExitProcess import is missing from PE entry stub";
+            return false;
+        }
+        const auto &patch = *stubs.exitProcess;
+        const uint64_t exitThunkVa = textVa + stubs.imports[exitIndex->second].stubOffset;
+        if (!architecture.applyRelocation(text, patch.fieldOffset, textVa + patch.fieldOffset, exitThunkVa, 0,
+                                          patch.type, "ExitProcess", error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static Buf BuildPeCoffHeader(const PeArchitectureConfig &architecture, const uint16_t sectionCount,
+                             const uint32_t timestamp, const bool isDll) {
+    Buf header;
+    WriteU16(header, architecture.machine);
+    WriteU16(header, sectionCount);
+    WriteU32(header, timestamp);
+    WriteU32(header, 0);
+    WriteU32(header, 0);   // no COFF symbol table
+    WriteU16(header, 240); // SizeOfOptionalHeader for PE32+
+    WriteU16(header, isDll ? kCharacteristicsDll : kCharacteristicsExecutable);
+    return header;
+}
 
 static bool FileExists(const std::filesystem::path &path) {
     std::error_code ec;
@@ -258,61 +532,47 @@ FindDllFile(const std::string &dll, const std::vector<std::filesystem::path> &se
     return std::nullopt;
 }
 
-bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
-    // 1. Collect imported external function names
+bool Linker::LinkPe32Plus(const std::filesystem::path &outputPath) {
+    const PeArchitectureConfig *architecture = PeArchitectureFor(targetArch);
+    if (architecture == nullptr) {
+        Error("internal: no PE32+ architecture configuration for target");
+        return false;
+    }
+    if (!graph) {
+        Error("internal: PE32+ linking requires an RCU link graph");
+        return false;
+    }
+    const bool isDll = artifactKind == ArtifactKind::SharedLibrary;
+    // Preferred bases follow x86-64 linker convention — 0x140000000 for
+    // executables, 0x180000000 for DLLs — but the .reloc table lets the
+    // loader place either anywhere.
+    const uint64_t imageBase = isDll ? 0x1'8000'0000ULL : kImageBase;
+    // 1. Assign referenced external functions to their import DLLs.
 
     // EXEs always need ExitProcess for the entry thunk; DLLs do not.
     std::unordered_map<std::string, std::string> importDll;
-    std::unordered_set<std::string> explicitImportDlls;
-    std::unordered_map<std::string, std::vector<std::string>> explicitImportFuncsByDll;
+    std::unordered_map<std::string, std::string> explicitImportDll;
     if (!isDll) {
         importDll["ExitProcess"] = "KERNEL32.DLL";
     }
 
-    // First pass: collect explicit DLL assignments from symbol
-    // declarations. This handles the case where a call site and its
-    // declaration are in different translation units — the declaration
-    // carries the DLL name.
+    // DLL ownership is format-specific metadata, so retain it separately
+    // from the format-neutral graph. Looking across declarations handles a
+    // call site whose DLL name is carried by another translation unit.
     for (const auto &obj : objects) {
         for (const auto &sym : obj.symbols) {
             if (sym.kind == RcuSymKind::ExternFunc && !sym.typeName.empty()) {
-                importDll[sym.name] = sym.typeName;
-                explicitImportDlls.insert(sym.typeName);
-                explicitImportFuncsByDll[sym.typeName].push_back(sym.name);
+                explicitImportDll[sym.name] = sym.typeName;
             }
         }
     }
 
-    // Collect all symbol names that are defined (non-extern) across all
-    // objects. Cross-module calls produce ExternFunc relocations but the
-    // callee is defined in another RcuFile — those must NOT be treated as
-    // OS DLL imports.
-    std::unordered_set<std::string> definedSymbols;
-    for (const auto &obj : objects) {
-        for (const auto &sym : obj.symbols) {
-            if (sym.kind != RcuSymKind::ExternFunc && sym.kind != RcuSymKind::ExternData && !sym.name.empty()) {
-                definedSymbols.insert(sym.name);
-            }
+    for (const RcuReferencedExternal &external : graph->ReferencedExternals()) {
+        if (external.kind != RcuSymKind::ExternFunc) {
+            continue;
         }
-    }
-
-    // Second pass: collect imports from relocations. For compiler-generated
-    // extern symbols (e.g. runtime helpers) that carry no explicit DLL,
-    // fall back to KERNEL32.DLL so existing behavior is preserved. Skip
-    // symbols that are defined locally (cross-module references, not DLL
-    // imports).
-    for (const auto &obj : objects) {
-        for (const auto &sec : obj.sections) {
-            for (const auto &reloc : sec.relocs) {
-                if (reloc.symbolIndex >= obj.symbols.size()) {
-                    continue;
-                }
-                const auto &sym = obj.symbols[reloc.symbolIndex];
-                if (sym.kind == RcuSymKind::ExternFunc && !definedSymbols.contains(sym.name)) {
-                    importDll.try_emplace(sym.name, "KERNEL32.DLL");
-                }
-            }
-        }
+        const auto explicitDll = explicitImportDll.find(external.name);
+        importDll[external.name] = explicitDll == explicitImportDll.end() ? "KERNEL32.DLL" : explicitDll->second;
     }
 
     // Sorted for determinism
@@ -329,11 +589,20 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     }
     const size_t numImports = importNames.size();
 
+    std::map<std::string, std::vector<std::string>> explicitImportsByDll;
+    for (const auto &[name, dll] : importDll) {
+        if (explicitImportDll.contains(name)) {
+            explicitImportsByDll[dll].push_back(name);
+        }
+    }
     const auto outputDir = outputPath.parent_path();
-    for (const auto &dll : explicitImportDlls) {
+    for (const auto &[dll, functions] : explicitImportsByDll) {
         auto dllPath = FindDllFile(dll, importSearchDirs, outputDir);
         if (!dllPath) {
-            Error("import DLL '" + dll + "' was not found");
+            // Export verification is best-effort: PE imports are resolved by
+            // name at load time, so the image links fine without the DLL. When
+            // cross-linking, target system DLLs (KERNEL32, ...) are legitimately
+            // absent from the host filesystem — a missing DLL is not an error.
             continue;
         }
 
@@ -343,7 +612,7 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
             continue;
         }
 
-        for (const auto &func : explicitImportFuncsByDll[dll]) {
+        for (const auto &func : functions) {
             if (!exports->contains(func)) {
                 Error("import function '" + func + "' was not found in DLL '" + dll + "'");
             }
@@ -353,89 +622,19 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
         return false;
     }
 
-    // 2. Build .text preamble (entry thunk + import thunks)
+    // 2. Build the architecture-owned entry and import stubs. Their patch
+    // metadata keeps the shared PE layout independent of instruction sizes.
+    PeStubs stubs = BuildPeStubs(*architecture, isDll, numImports);
+    Buf &textPre = stubs.bytes;
 
-    Buf textPre;
-
-    if (isDll) {
-        // DLL entry point: _DllMainCRTStartup / DllMain proxy
-        // Win64 DLL entry: BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
-        // args: rcx=hModule, rdx=fdwReason, r8=lpvReserved
-        // We call user's DllMain if it exists, otherwise just return TRUE
-        // (1).
-        //
-        // Thunk layout:
-        //   sub  rsp, 0x28
-        //   call DllMain       ; E8 disp32  (patched; if DllMain defined)
-        //   mov  eax, 1        ; return TRUE if DllMain missing or returned
-        //   0 add  rsp, 0x28 ret
-        //
-        // If DllMain is not defined in user code we emit a minimal stub
-        // that just returns TRUE — standard DLL behaviour when no
-        // initialisation needed.
-        textPre.insert(textPre.end(), {0x48, 0x83, 0xEC, 0x28}); // sub rsp, 0x28
-        const size_t kCallDllMainDisp = textPre.size() + 1;
-        textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00}); // call DllMain
-        // If DllMain returned 0 (init failed), still propagate it;
-        // otherwise keep eax. For simplicity, we trust DllMain's return value directly.
-        textPre.insert(textPre.end(), {0x48, 0x83, 0xC4, 0x28}); // add rsp, 0x28
-        textPre.push_back(0xC3);                                 // ret
-        (void)kCallDllMainDisp;                                  // used below during patching
-    }
-    else {
-        // EXE entry thunk (__rux_start):
-        //   sub rsp, 0x28       ; 48 83 EC 28
-        //   call Main           ; E8 xx xx xx xx
-        //   mov ecx, eax        ; 89 C1
-        //   call ExitProcess    ; E8 xx xx xx xx
-        //   int3                ; CC
-        textPre.insert(textPre.end(), {0x48, 0x83, 0xEC, 0x28});
-    }
-    const size_t kCallMainDisp = isDll ? 5 : textPre.size() + 1; // offset of 4-byte disp field
-    if (!isDll) {
-        textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00});
-        textPre.insert(textPre.end(), {0x89, 0xC1});
-    }
-    const size_t kCallExitDisp = textPre.size() + 1;
-    if (!isDll) {
-        textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00});
-        textPre.push_back(0xCC);
-    }
-
-    // Import thunks: jmp qword ptr [rip+disp32] = FF 25 xx xx xx xx
-    std::vector<size_t> thunkOff(numImports);
-    for (size_t i = 0; i < numImports; ++i) {
-        thunkOff[i] = textPre.size();
-        textPre.insert(textPre.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
-    }
-
-    const auto preambleSize = static_cast<uint32_t>(textPre.size());
-
-    // 3. Merge RCU sections
-
-    struct ObjLayout {
-        uint32_t textOff, rodataOff, dataOff;
-    };
-
-    std::vector<ObjLayout> layouts(objects.size());
-    Buf mergedText, mergedRodata, mergedData;
-
-    for (size_t i = 0; i < objects.size(); ++i) {
-        const auto &obj = objects[i];
-        layouts[i] = {static_cast<uint32_t>(mergedText.size()), static_cast<uint32_t>(mergedRodata.size()),
-                      static_cast<uint32_t>(mergedData.size())};
-        for (const auto &sec : obj.sections) {
-            if (sec.type == RcuSecType::Text) {
-                mergedText.insert(mergedText.end(), sec.data.begin(), sec.data.end());
-            }
-            else if (sec.type == RcuSecType::RoData) {
-                mergedRodata.insert(mergedRodata.end(), sec.data.begin(), sec.data.end());
-            }
-            else if (sec.type == RcuSecType::Data) {
-                mergedData.insert(mergedData.end(), sec.data.begin(), sec.data.end());
-            }
-        }
-    }
+    // 3. Merge RCU sections after the format-owned entry and import stubs.
+    RcuLayoutPrefixes prefixes;
+    prefixes.text = textPre;
+    prefixes.textPadding = architecture->codePadding;
+    const RcuObjectLayout layout = RcuObjectLayout::Build(objects, prefixes);
+    Buf textBuf = layout.Data(RcuMergedSection::Text);
+    Buf rdataBuf = layout.Data(RcuMergedSection::RoData);
+    Buf dataBuf = layout.Data(RcuMergedSection::Data);
 
     // 4. Build import table appended to .rdata
     // Layout within .rdata (after user rodata):
@@ -446,8 +645,6 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     //   [DLL name strings]
     //   [IMAGE_IMPORT_BY_NAME entries per function]
 
-    Buf rdataBuf;
-    rdataBuf.insert(rdataBuf.end(), mergedRodata.begin(), mergedRodata.end());
     PadTo(rdataBuf, 8);
     std::map<std::string, std::vector<size_t>> importsByDll;
     for (size_t i = 0; i < numImports; ++i) {
@@ -456,6 +653,11 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     const auto importDirOff = static_cast<uint32_t>(rdataBuf.size());
     const size_t importDirPos = rdataBuf.size();
     WriteZeros(rdataBuf, (importsByDll.size() + 1) * 20);
+    // IMAGE_IMPORT_DESCRIPTOR is 20 bytes, so an even number of DLL groups
+    // leaves the directory plus its null descriptor only four-byte aligned.
+    // Each PE32+ thunk is a uint64_t and an AArch64 import stub addresses its
+    // IAT entry with a scaled 64-bit LDR; align both thunk-table families.
+    PadTo(rdataBuf, 8);
     std::vector<std::string> importDllNames;
     std::vector<std::vector<size_t>> importDllMembers;
     importDllNames.reserve(importsByDll.size());
@@ -471,6 +673,7 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
         intPos[g] = rdataBuf.size();
         WriteZeros(rdataBuf, (importDllMembers[g].size() + 1) * 8);
     }
+    PadTo(rdataBuf, 8);
     const auto iatOff = static_cast<uint32_t>(rdataBuf.size());
     std::vector<uint32_t> iatGroupOff(importDllNames.size());
     std::vector<size_t> iatPos(importDllNames.size());
@@ -501,27 +704,73 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
         PadTo(rdataBuf, 2);
     }
 
+    // Reserve the complete export directory before assigning section RVAs.
+    // Appending it after layout could move .data to another page and leave
+    // already-resolved data symbols pointing at the old address.
+    const std::vector<std::string> exportNames = isDll ? WindowsExportNames() : std::vector<std::string>{};
+
+    uint32_t exportDirOff = 0;
+    uint32_t exportDirSize = 0;
+    size_t exportDirectoryPosition = 0;
+    uint32_t exportFunctionArrayOff = 0;
+    uint32_t exportNameArrayOff = 0;
+    uint32_t exportOrdinalArrayOff = 0;
+    uint32_t exportDllNameOff = 0;
+    std::vector<uint32_t> exportNameStringOffsets;
+    if (!exportNames.empty()) {
+        exportDirOff = static_cast<uint32_t>(rdataBuf.size());
+        exportDirectoryPosition = rdataBuf.size();
+        WriteZeros(rdataBuf, 40);
+
+        exportFunctionArrayOff = static_cast<uint32_t>(rdataBuf.size());
+        WriteZeros(rdataBuf, exportNames.size() * 4);
+        exportNameArrayOff = static_cast<uint32_t>(rdataBuf.size());
+        WriteZeros(rdataBuf, exportNames.size() * 4);
+        exportOrdinalArrayOff = static_cast<uint32_t>(rdataBuf.size());
+        for (size_t i = 0; i < exportNames.size(); ++i) {
+            WriteU16(rdataBuf, static_cast<uint16_t>(i));
+        }
+
+        exportDllNameOff = static_cast<uint32_t>(rdataBuf.size());
+        WriteCStr(rdataBuf, System::SharedLibraryFileName(packageName, Target::OS::Windows).c_str());
+        PadTo(rdataBuf, 2);
+        exportNameStringOffsets.reserve(exportNames.size());
+        for (const auto &name : exportNames) {
+            exportNameStringOffsets.push_back(static_cast<uint32_t>(rdataBuf.size()));
+            WriteCStr(rdataBuf, name.c_str());
+            PadTo(rdataBuf, 2);
+        }
+        exportDirSize = static_cast<uint32_t>(rdataBuf.size()) - exportDirOff;
+    }
+
     // 5. Compute section layout (RVAs and file offsets)
-    const uint32_t numSections = mergedData.empty() ? 2u : 3u;
+    // Every Abs64 fixup becomes an IMAGE_REL_BASED_DIR64 entry, so the .reloc
+    // section exists exactly when the merged objects contain one.
+    const bool hasAbsoluteFixups = std::ranges::any_of(graph->References(), [&](const RcuLinkReference &reference) {
+        const RcuReloc &relocation =
+            objects[reference.objectIndex].sections[reference.sectionIndex].relocs[reference.relocationIndex];
+        return relocation.type == RcuRelType::Abs64 && layout.Relocation(reference).has_value();
+    });
+    const uint32_t numSections = (dataBuf.empty() ? 2u : 3u) + (hasAbsoluteFixups ? 1u : 0u);
     const uint32_t rawHdrBytes = 64 + 4 + 20 + 240 + numSections * 40;
     const uint32_t sizeOfHeaders = AlignUp(rawHdrBytes, kFileAlign);
     const uint32_t textRva = AlignUp(sizeOfHeaders, kSecAlign);
-    const uint32_t textVirtSize = preambleSize + static_cast<uint32_t>(mergedText.size());
+    const uint32_t textVirtSize = static_cast<uint32_t>(textBuf.size());
     const uint32_t textFileSize = AlignUp(textVirtSize, kFileAlign);
     const uint32_t textFileOff = sizeOfHeaders;
     const uint32_t rdataRva = textRva + AlignUp(textVirtSize, kSecAlign);
-    const auto rdataVirtSize = static_cast<uint32_t>(rdataBuf.size());
-    const uint32_t rdataFileSize = AlignUp(rdataVirtSize, kFileAlign);
+    auto rdataVirtSize = static_cast<uint32_t>(rdataBuf.size());
+    uint32_t rdataFileSize = AlignUp(rdataVirtSize, kFileAlign);
     const uint32_t rdataFileOff = textFileOff + textFileSize;
     uint32_t dataRva = 0, dataVirtSize = 0, dataFileSize = 0, dataFileOff = 0;
-    if (!mergedData.empty()) {
+    if (!dataBuf.empty()) {
         dataRva = rdataRva + AlignUp(rdataVirtSize, kSecAlign);
-        dataVirtSize = static_cast<uint32_t>(mergedData.size());
+        dataVirtSize = static_cast<uint32_t>(dataBuf.size());
         dataFileSize = AlignUp(dataVirtSize, kFileAlign);
         dataFileOff = rdataFileOff + rdataFileSize;
     }
     const uint32_t sizeOfImage =
-        !mergedData.empty() ? dataRva + AlignUp(dataVirtSize, kSecAlign) : rdataRva + AlignUp(rdataVirtSize, kSecAlign);
+        !dataBuf.empty() ? dataRva + AlignUp(dataVirtSize, kSecAlign) : rdataRva + AlignUp(rdataVirtSize, kSecAlign);
 
     // 6. Patch .rdata import table with real RVAs
     for (size_t g = 0; g < importDllNames.size(); ++g) {
@@ -543,192 +792,113 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     }
     // null descriptor and null thunk terminators already zeroed
 
-    // 7. Build global symbol map (name → VA)
+    // 7. Resolve graph locations against the final PE section bases.
+    const RcuSectionBases sectionBases{
+        .text = imageBase + textRva,
+        .rodata = imageBase + rdataRva,
+        .data = imageBase + dataRva,
+    };
+    const auto symbolAddress = [&](const RcuSymbolLocation location) -> std::optional<uint64_t> {
+        const auto placement = layout.Symbol(location);
+        return placement ? RcuObjectLayout::Address(*placement, sectionBases) : std::nullopt;
+    };
 
-    std::unordered_map<std::string, uint64_t> symMap;
-
-    // Add all imported function thunks first
+    std::unordered_map<std::string, uint64_t> importThunks;
     for (size_t i = 0; i < numImports; ++i) {
-        symMap[importNames[i]] = kImageBase + textRva + thunkOff[i];
+        importThunks[importNames[i]] = imageBase + textRva + stubs.imports[i].stubOffset;
     }
 
-    // Add symbols defined in each RCU file. Local data/constant symbols are
-    // intentionally not added here: generated labels such as __f64_0 are
-    // reused per object and must resolve relative to their owning object.
-    for (size_t i = 0; i < objects.size(); ++i) {
-        const auto &obj = objects[i];
-        const auto &lay = layouts[i];
-        for (const auto &sym : obj.symbols) {
-            if (sym.name.empty()) {
+    if (!exportNames.empty()) {
+        const auto numberOfExports = static_cast<uint32_t>(exportNames.size());
+        for (uint32_t i = 0; i < numberOfExports; ++i) {
+            const auto location = graph->FindDefinition(exportNames[i]);
+            const auto address = location ? symbolAddress(*location) : std::nullopt;
+            if (!address) {
+                Error("internal: exported PE symbol '" + exportNames[i] + "' was not resolved");
                 continue;
             }
-            if (sym.kind == RcuSymKind::ExternFunc || sym.kind == RcuSymKind::ExternData) {
-                continue; // already handled via thunks
-            }
-            if (sym.visibility == RcuSymVis::Local && sym.kind != RcuSymKind::Func && sym.name != "Main") {
-                continue;
-            }
-            uint64_t va = 0;
-            if (sym.sectionIdx == RCU_TEXT_IDX) {
-                va = kImageBase + textRva + preambleSize + lay.textOff + sym.value;
-            }
-            else if (sym.sectionIdx == RCU_RODATA_IDX) {
-                va = kImageBase + rdataRva + lay.rodataOff + sym.value;
-            }
-            else if (sym.sectionIdx == RCU_DATA_IDX) {
-                va = kImageBase + dataRva + lay.dataOff + sym.value;
-            }
-            else {
-                continue;
-            }
-            symMap.try_emplace(sym.name, va); // first definition wins
+            Patch32(rdataBuf, exportFunctionArrayOff + i * 4, static_cast<uint32_t>(*address - imageBase));
+            Patch32(rdataBuf, exportNameArrayOff + i * 4, rdataRva + exportNameStringOffsets[i]);
         }
+        Patch32(rdataBuf, exportDirectoryPosition + 0, 0);                            // Characteristics
+        Patch32(rdataBuf, exportDirectoryPosition + 4, 0);                            // deterministic timestamp
+        Patch32(rdataBuf, exportDirectoryPosition + 12, rdataRva + exportDllNameOff); // Name
+        Patch32(rdataBuf, exportDirectoryPosition + 16, 1);                           // ordinal base
+        Patch32(rdataBuf, exportDirectoryPosition + 20, numberOfExports);
+        Patch32(rdataBuf, exportDirectoryPosition + 24, numberOfExports);
+        Patch32(rdataBuf, exportDirectoryPosition + 28, rdataRva + exportFunctionArrayOff);
+        Patch32(rdataBuf, exportDirectoryPosition + 32, rdataRva + exportNameArrayOff);
+        Patch32(rdataBuf, exportDirectoryPosition + 36, rdataRva + exportOrdinalArrayOff);
+    }
+    if (!errors.empty()) {
+        return false;
     }
 
-    // 8. Build final .text (preamble + user code)
-    Buf textBuf;
-    textBuf.insert(textBuf.end(), textPre.begin(), textPre.end());
-    textBuf.insert(textBuf.end(), mergedText.begin(), mergedText.end());
-
-    // Patch import thunks: jmp [rip + disp32] → IAT entry
-    for (size_t i = 0; i < numImports; ++i) {
-        uint64_t thunkVA = kImageBase + textRva + thunkOff[i];
-        uint64_t iatEntryVA = kImageBase + rdataRva + iatEntryOff[i];
-        auto disp = static_cast<int32_t>(iatEntryVA - (thunkVA + 6));
-        Patch32(textBuf, thunkOff[i] + 2, static_cast<uint32_t>(disp));
+    // 8. Patch the format-owned entry and import stubs.
+    const std::optional<RcuSymbolLocation> entryLocation =
+        isDll ? graph->FindDefinition("DllMain") : graph->EntryRoot();
+    const std::optional<uint64_t> entryAddress = entryLocation ? symbolAddress(*entryLocation) : std::nullopt;
+    std::string stubError;
+    if (!PatchPeStubs(*architecture, stubs, textBuf, imageBase + textRva, imageBase + rdataRva, iatEntryOff,
+                      importNames, importIdx, entryAddress, isDll, stubError)) {
+        Error(std::move(stubError));
+        return false;
     }
 
-    // Patch entry thunk: call Main (EXE) or DllMain (DLL)
-    if (isDll) {
-        // DllMain is optional: if not defined, patch the call to target the
-        // instruction immediately after it so it falls through to `ret`
-        // returning whatever eax happened to hold (Windows
-        // default-initialises to 0, but the sub/add rsp frame means the
-        // caller sees TRUE from a fresh eax on many ABIs). We make it
-        // explicit: if no DllMain, patch to call a tiny inline stub that
-        // sets eax=1 then returns.
-        //
-        // Simple approach: if DllMain absent, replace the call+6-byte nop
-        // with `mov eax, 1; nop` so the stub just returns TRUE.
-        auto it = symMap.find("DllMain");
-        if (it != symMap.end()) {
-            uint64_t dllMainVA = it->second;
-            uint64_t nextInst = kImageBase + textRva + kCallMainDisp + 4;
-            Patch32(textBuf, kCallMainDisp, static_cast<uint32_t>(dllMainVA - nextInst));
+    // 9. Patch graph references in the merged user sections.
+    std::vector<uint32_t> baseRelocationRvas;
+    for (const RcuLinkReference &reference : graph->References()) {
+        const RcuFile &object = objects[reference.objectIndex];
+        const RcuReloc &relocation = object.sections[reference.sectionIndex].relocs[reference.relocationIndex];
+        const RcuSymbol &symbol = object.symbols[reference.symbolIndex];
+        const auto sitePlacement = layout.Relocation(reference);
+        const auto siteAddress = sitePlacement ? RcuObjectLayout::Address(*sitePlacement, sectionBases) : std::nullopt;
+        if (!sitePlacement || !siteAddress) {
+            continue;
         }
-        else {
-            // No DllMain: replace `E8 00 00 00 00` with `B8 01 00 00 00`
-            // (mov eax, 1)
-            textBuf[kCallMainDisp - 1] = 0xB8; // change opcode from E8 (call) to B8 (mov eax,
-            // imm32)
-            Patch32(textBuf, kCallMainDisp, 1); // imm = 1 (TRUE)
+
+        Buf *buffer = nullptr;
+        switch (sitePlacement->section) {
+        case RcuMergedSection::Text:
+            buffer = &textBuf;
+            break;
+        case RcuMergedSection::RoData:
+            buffer = &rdataBuf;
+            break;
+        case RcuMergedSection::Data:
+            buffer = &dataBuf;
+            break;
+        case RcuMergedSection::Bss:
+            continue;
         }
-    }
-    else {
-        auto it = symMap.find("Main");
-        if (it == symMap.end()) {
-            Error("undefined symbol 'Main' — no entry point found");
-            return false;
+
+        if (relocation.type == RcuRelType::Abs64) {
+            baseRelocationRvas.push_back(static_cast<uint32_t>(*siteAddress - imageBase));
         }
-        uint64_t mainVA = it->second;
-        uint64_t nextInst = kImageBase + textRva + kCallMainDisp + 4;
-        Patch32(textBuf, kCallMainDisp, static_cast<uint32_t>(mainVA - nextInst));
-    }
 
-    // Patch entry thunk: call ExitProcess thunk (EXE only)
-    if (!isDll) {
-        uint64_t exitVA = kImageBase + textRva + thunkOff[importIdx["ExitProcess"]];
-        uint64_t nextInst = kImageBase + textRva + kCallExitDisp + 4;
-        Patch32(textBuf, kCallExitDisp, static_cast<uint32_t>(exitVA - nextInst));
-    }
+        std::optional<uint64_t> targetAddress;
+        if (reference.resolution == RcuLinkResolution::External) {
+            const auto imported = importThunks.find(symbol.name);
+            if (imported != importThunks.end()) {
+                targetAddress = imported->second;
+            }
+        }
+        else if (reference.definition) {
+            targetAddress = symbolAddress(*reference.definition);
+        }
+        if (!targetAddress) {
+            if (symbol.kind == RcuSymKind::ExternFunc) {
+                Error("undefined external symbol '" + symbol.name + "'");
+            }
+            continue;
+        }
 
-    // 9. Patch user code relocations
-
-    for (size_t i = 0; i < objects.size(); ++i) {
-        const auto &obj = objects[i];
-        const auto &lay = layouts[i];
-        for (const auto &sec : obj.sections) {
-            Buf *buf = nullptr;
-            uint32_t baseInBuf = 0;
-            uint64_t secBaseVA = 0;
-            if (sec.type == RcuSecType::Text) {
-                buf = &textBuf;
-                baseInBuf = preambleSize + lay.textOff;
-                secBaseVA = kImageBase + textRva + preambleSize + lay.textOff;
-            }
-            else if (sec.type == RcuSecType::RoData) {
-                buf = &rdataBuf;
-                baseInBuf = lay.rodataOff;
-                secBaseVA = kImageBase + rdataRva + lay.rodataOff;
-            }
-            else if (sec.type == RcuSecType::Data) {
-                buf = &mergedData;
-                baseInBuf = lay.dataOff;
-                secBaseVA = kImageBase + dataRva + lay.dataOff;
-            }
-            else {
-                continue;
-            }
-
-            for (const auto &reloc : sec.relocs) {
-                if (reloc.symbolIndex >= obj.symbols.size()) {
-                    continue;
-                }
-                const auto &sym = obj.symbols[reloc.symbolIndex];
-
-                // Resolve target VA
-                uint64_t targetVA = 0;
-                if (sym.kind == RcuSymKind::ExternFunc) {
-                    // OS import: resolved via thunk
-                    auto it = symMap.find(sym.name);
-                    if (it == symMap.end()) {
-                        Error("undefined external symbol '" + sym.name + "'");
-                        continue;
-                    }
-                    targetVA = it->second;
-                }
-                else if (sym.visibility != RcuSymVis::Local && !sym.name.empty() && symMap.contains(sym.name)) {
-                    // Named exported symbol, including cross-module
-                    // references.
-                    targetVA = symMap[sym.name];
-                }
-                else {
-                    // Unnamed or purely local — compute from section index
-                    if (sym.sectionIdx == RCU_TEXT_IDX) {
-                        targetVA = kImageBase + textRva + preambleSize + lay.textOff + sym.value;
-                    }
-                    else if (sym.sectionIdx == RCU_RODATA_IDX) {
-                        targetVA = kImageBase + rdataRva + lay.rodataOff + sym.value;
-                    }
-                    else if (sym.sectionIdx == RCU_DATA_IDX) {
-                        targetVA = kImageBase + dataRva + lay.dataOff + sym.value;
-                    }
-                    else {
-                        continue;
-                    }
-                }
-                const size_t patchAt = baseInBuf + reloc.sectionOffset;
-                const uint64_t siteVA = secBaseVA + reloc.sectionOffset;
-                if (reloc.type == RcuRelType::Rel32) {
-                    if (patchAt + 4 > buf->size()) {
-                        continue;
-                    }
-                    auto disp = static_cast<int32_t>(targetVA + reloc.addend - (siteVA + 4));
-                    Patch32(*buf, patchAt, static_cast<uint32_t>(disp));
-                }
-                else if (reloc.type == RcuRelType::Abs64) {
-                    if (patchAt + 8 > buf->size()) {
-                        continue;
-                    }
-                    Patch64(*buf, patchAt, targetVA + static_cast<uint64_t>(reloc.addend));
-                }
-                else if (reloc.type == RcuRelType::Abs32) {
-                    if (patchAt + 4 > buf->size()) {
-                        continue;
-                    }
-                    Patch32(*buf, patchAt, static_cast<uint32_t>(targetVA + reloc.addend));
-                }
-            }
+        std::string relocationError;
+        if (!architecture->applyRelocation(*buffer, static_cast<size_t>(sitePlacement->offset), *siteAddress,
+                                           *targetAddress, relocation.addend, relocation.type, symbol.name,
+                                           relocationError)) {
+            auto notes = RelocationNotes(reference, relocationError);
+            Error(std::move(relocationError), std::move(notes));
         }
     }
 
@@ -736,91 +906,36 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
         return false;
     }
 
-    // Build export directory for DLLs
-    // We export all pub functions that are marked as exported symbols.
-    // Collect exported function names (non-extern, non-local, Func kind).
-    std::vector<std::string> exportNames;
-    if (isDll) {
-        for (const auto &obj : objects) {
-            for (const auto &sym : obj.symbols) {
-                if (sym.kind == RcuSymKind::Func && sym.visibility != RcuSymVis::Local && !sym.name.empty() &&
-                    sym.name != "DllMain" && symMap.contains(sym.name)) {
-                    exportNames.push_back(sym.name);
-                }
-            }
+    // 10. Build the base-relocation table: one block per 4 KB page holding an
+    // IMAGE_REL_BASED_DIR64 entry per fixup, padded to a four-byte block size
+    // with an IMAGE_REL_BASED_ABSOLUTE no-op.
+    std::ranges::sort(baseRelocationRvas);
+    Buf relocBuf;
+    for (size_t first = 0; first < baseRelocationRvas.size();) {
+        const uint32_t page = baseRelocationRvas[first] & ~0xFFFu;
+        size_t last = first;
+        while (last < baseRelocationRvas.size() && (baseRelocationRvas[last] & ~0xFFFu) == page) {
+            ++last;
         }
-        std::ranges::sort(exportNames);
-        exportNames.erase(std::ranges::unique(exportNames).begin(), exportNames.end());
+        const size_t entryCount = last - first;
+        WriteU32(relocBuf, page);
+        WriteU32(relocBuf, static_cast<uint32_t>(8 + (entryCount + entryCount % 2) * 2));
+        for (; first < last; ++first) {
+            WriteU16(relocBuf, static_cast<uint16_t>(0xA000u | (baseRelocationRvas[first] & 0xFFFu)));
+        }
+        if (entryCount % 2 != 0) {
+            WriteU16(relocBuf, 0);
+        }
     }
+    // .reloc follows the last mapped section; numSections and sizeOfHeaders
+    // already account for it whenever the objects contain an Abs64 fixup.
+    const auto relocVirtSize = static_cast<uint32_t>(relocBuf.size());
+    const uint32_t relocRva = sizeOfImage;
+    const uint32_t relocFileSize = AlignUp(relocVirtSize, kFileAlign);
+    const uint32_t relocFileOff = dataBuf.empty() ? rdataFileOff + rdataFileSize : dataFileOff + dataFileSize;
+    const uint32_t finalSizeOfImage = relocBuf.empty() ? sizeOfImage : relocRva + AlignUp(relocVirtSize, kSecAlign);
 
-    // Build export directory data (appended to .rdata)
-    uint32_t exportDirOff = 0;
-    uint32_t exportDirSize = 0;
-    if (isDll && !exportNames.empty()) {
-        exportDirOff = static_cast<uint32_t>(rdataBuf.size());
-        const auto numExports = static_cast<uint32_t>(exportNames.size());
-
-        // Reserve IMAGE_EXPORT_DIRECTORY (40 bytes)
-        const size_t expDirPos = rdataBuf.size();
-        WriteZeros(rdataBuf, 40);
-
-        // AddressOfFunctions array (RVAs)
-        const auto funcArrayOff = static_cast<uint32_t>(rdataBuf.size());
-        for (uint32_t i = 0; i < numExports; ++i) {
-            WriteU32(rdataBuf, 0); // patched below
-        }
-
-        // AddressOfNames array (RVAs to name strings)
-        const auto nameArrayOff = static_cast<uint32_t>(rdataBuf.size());
-        for (uint32_t i = 0; i < numExports; ++i) {
-            WriteU32(rdataBuf, 0); // patched below
-        }
-
-        // AddressOfNameOrdinals array
-        const auto ordArrayOff = static_cast<uint32_t>(rdataBuf.size());
-        for (uint32_t i = 0; i < numExports; ++i) {
-            WriteU16(rdataBuf, static_cast<uint16_t>(i));
-        }
-
-        // DLL name string
-        const auto dllNameStrOff = static_cast<uint32_t>(rdataBuf.size());
-        WriteCStr(rdataBuf, System::SharedLibraryFileName(packageName, Target::OS::Windows).c_str());
-        PadTo(rdataBuf, 2);
-
-        // Function name strings + patch name/func arrays
-        for (uint32_t i = 0; i < numExports; ++i) {
-            const auto nameStrOff = static_cast<uint32_t>(rdataBuf.size());
-            WriteCStr(rdataBuf, exportNames[i].c_str());
-            PadTo(rdataBuf, 2);
-            // Patch name array entry
-            Patch32(rdataBuf, nameArrayOff + i * 4, rdataRva + nameStrOff);
-            // Patch function RVA
-            auto it = symMap.find(exportNames[i]);
-            if (it != symMap.end()) {
-                auto funcRva = static_cast<uint32_t>(it->second - kImageBase);
-                Patch32(rdataBuf, funcArrayOff + i * 4, funcRva);
-            }
-        }
-
-        exportDirSize = static_cast<uint32_t>(rdataBuf.size()) - exportDirOff;
-
-        // Patch IMAGE_EXPORT_DIRECTORY fields
-        Patch32(rdataBuf, expDirPos + 0, 0); // Characteristics
-        Patch32(rdataBuf, expDirPos + 4,
-                static_cast<uint32_t>(std::time(nullptr)));          // TimeDateStamp
-        Patch32(rdataBuf, expDirPos + 12, rdataRva + dllNameStrOff); // Name RVA
-        Patch32(rdataBuf, expDirPos + 16, 1);                        // Base (ordinal base)
-        Patch32(rdataBuf, expDirPos + 20, numExports);               // NumberOfFunctions
-        Patch32(rdataBuf, expDirPos + 24, numExports);               // NumberOfNames
-        Patch32(rdataBuf, expDirPos + 28,
-                rdataRva + funcArrayOff); // AddressOfFunctions
-        Patch32(rdataBuf, expDirPos + 32,
-                rdataRva + nameArrayOff); // AddressOfNames
-        Patch32(rdataBuf, expDirPos + 36,
-                rdataRva + ordArrayOff); // AddressOfNameOrdinals
-    }
-
-    // 10. Emit PE32+ file
+    // 11. Emit PE32+ file
     std::filesystem::create_directories(outputPath.parent_path());
     std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -864,36 +979,29 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     writeRaw("PE\0\0", 4); // PE signature
 
     // COFF File Header (20 bytes)
-    wU16(kMachineAmd64);
-    wU16(static_cast<uint16_t>(numSections));
-    wU32(static_cast<uint32_t>(std::time(nullptr)));
-    wU32(0);
-    wU32(0);   // no COFF symbol table
-    wU16(240); // SizeOfOptionalHeader for PE32+
-    // EXE: EXECUTABLE | LARGE_ADDRESS_AWARE
-    // DLL: EXECUTABLE | LARGE_ADDRESS_AWARE | DLL
-    wU16(isDll ? kCharacteristicsDll : static_cast<uint16_t>(0x0022u));
+    wBuf(BuildPeCoffHeader(*architecture, static_cast<uint16_t>(numSections), static_cast<uint32_t>(std::time(nullptr)),
+                           isDll));
 
     // Optional Header PE32+ (240 bytes)
     wU16(kMagicPE32P);
     wU8(14);
-    wU8(0);                             // Linker version 14.0
-    wU32(textFileSize);                 // SizeOfCode
-    wU32(rdataFileSize + dataFileSize); // SizeOfInitializedData
-    wU32(0);                            // SizeOfUninitializedData
-    wU32(textRva);                      // AddressOfEntryPoint (__rux_start at start of .text)
-    wU32(textRva);                      // BaseOfCode
-    wU64(kImageBase);
+    wU8(0);                                             // Linker version 14.0
+    wU32(textFileSize);                                 // SizeOfCode
+    wU32(rdataFileSize + dataFileSize + relocFileSize); // SizeOfInitializedData
+    wU32(0);                                            // SizeOfUninitializedData
+    wU32(textRva);                                      // AddressOfEntryPoint (__rux_start at start of .text)
+    wU32(textRva);                                      // BaseOfCode
+    wU64(imageBase);
     wU32(kSecAlign);
     wU32(kFileAlign);
-    wU16(6);
-    wU16(0); // MajorOSVersion / MinorOSVersion
+    wU16(architecture->minimumOsVersionMajor);
+    wU16(architecture->minimumOsVersionMinor); // MajorOSVersion / MinorOSVersion
     wU16(0);
     wU16(0); // MajorImageVersion / MinorImageVersion
-    wU16(6);
-    wU16(0); // MajorSubsystemVersion 6.0 (Vista+)
-    wU32(0); // Win32VersionValue
-    wU32(sizeOfImage);
+    wU16(architecture->minimumOsVersionMajor);
+    wU16(architecture->minimumOsVersionMinor); // MajorSubsystemVersion / MinorSubsystemVersion
+    wU32(0);                                   // Win32VersionValue
+    wU32(finalSizeOfImage);
     wU32(sizeOfHeaders);
     wU32(0); // CheckSum
     wU16(isDll ? kSubsystemGUI : kSubsystemCUI);
@@ -907,19 +1015,19 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     // DataDirectory[16]
     // [0] Export — filled for DLLs, empty for EXEs
     wDir(isDll && exportDirSize > 0 ? rdataRva + exportDirOff : 0, isDll && exportDirSize > 0 ? exportDirSize : 0);
-    wDir(rdataRva + importDirOff,
-         static_cast<uint32_t>((importDllNames.size() + 1) * 20)); // [1]  Import
+    wDir(importDllNames.empty() ? 0 : rdataRva + importDirOff,
+         importDllNames.empty() ? 0 : static_cast<uint32_t>((importDllNames.size() + 1) * 20)); // [1] Import
+    wDir(0, 0);
+    wDir(0, 0);
+    wDir(0, 0);                                           // [2..4]
+    wDir(relocBuf.empty() ? 0 : relocRva, relocVirtSize); // [5] Base relocation
+    wDir(0, 0);
+    wDir(0, 0); // [6..7]
     wDir(0, 0);
     wDir(0, 0);
     wDir(0, 0);
-    wDir(0, 0);
-    wDir(0, 0);
-    wDir(0, 0); // [2..7]
-    wDir(0, 0);
-    wDir(0, 0);
-    wDir(0, 0);
-    wDir(0, 0);                       // [8..11]
-    wDir(rdataRva + iatOff, iatSize); // [12] IAT
+    wDir(0, 0);                                          // [8..11]
+    wDir(iatSize == 0 ? 0 : rdataRva + iatOff, iatSize); // [12] IAT
     wDir(0, 0);
     wDir(0, 0);
     wDir(0, 0); // [13..15]
@@ -944,7 +1052,7 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
     wU16(0);
     wU16(0);
     wU32(kScnRData);
-    if (!mergedData.empty()) {
+    if (!dataBuf.empty()) {
         wSec8(".data");
         wU32(dataVirtSize);
         wU32(dataRva);
@@ -956,14 +1064,30 @@ bool Linker::LinkPe64(const std::filesystem::path &outputPath) {
         wU16(0);
         wU32(kScnData);
     }
+    if (!relocBuf.empty()) {
+        wSec8(".reloc");
+        wU32(relocVirtSize);
+        wU32(relocRva);
+        wU32(relocFileSize);
+        wU32(relocFileOff);
+        wU32(0);
+        wU32(0);
+        wU16(0);
+        wU16(0);
+        wU32(kScnReloc);
+    }
     padTo(kFileAlign);
     // Section data
     wBuf(textBuf);
     padTo(kFileAlign);
     wBuf(rdataBuf);
     padTo(kFileAlign);
-    if (!mergedData.empty()) {
-        wBuf(mergedData);
+    if (!dataBuf.empty()) {
+        wBuf(dataBuf);
+        padTo(kFileAlign);
+    }
+    if (!relocBuf.empty()) {
+        wBuf(relocBuf);
         padTo(kFileAlign);
     }
     return errors.empty();

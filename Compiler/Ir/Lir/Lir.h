@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Semantic/DropGlue.h"
 #include "Semantic/Type.h"
 #include "Target/AsmInstr.h"
 #include "Target/CallingConvention.h"
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Rux {
@@ -28,7 +30,6 @@ enum class LirOpcode {
     Mul,
     Div,
     Mod,
-    Pow,
     // Bitwise / shift
     And,
     Or,
@@ -64,6 +65,82 @@ enum class LirOpcode {
     StringAddr, // %dst = stringaddr <value> — address of static literal storage
 };
 
+/// The spelling of an opcode, as a dump writes it and as a diagnostic names it. One name serves both, so a back end
+/// reporting an opcode it cannot lower yet names the same thing the LIR dump beside it does.
+[[nodiscard]] constexpr std::string_view LirOpcodeName(const LirOpcode op) noexcept {
+    switch (op) {
+    case LirOpcode::Const:
+        return "const";
+    case LirOpcode::Alloca:
+        return "alloca";
+    case LirOpcode::Load:
+        return "load";
+    case LirOpcode::Store:
+        return "store";
+    case LirOpcode::Add:
+        return "add";
+    case LirOpcode::Sub:
+        return "sub";
+    case LirOpcode::Mul:
+        return "mul";
+    case LirOpcode::Div:
+        return "div";
+    case LirOpcode::Mod:
+        return "mod";
+    case LirOpcode::And:
+        return "and";
+    case LirOpcode::Or:
+        return "or";
+    case LirOpcode::Xor:
+        return "xor";
+    case LirOpcode::Shl:
+        return "shl";
+    case LirOpcode::Shr:
+        return "shr";
+    case LirOpcode::Lshr:
+        return "lshr";
+    case LirOpcode::Neg:
+        return "neg";
+    case LirOpcode::Not:
+        return "not";
+    case LirOpcode::BitNot:
+        return "bitnot";
+    case LirOpcode::CmpEq:
+        return "cmpeq";
+    case LirOpcode::CmpNe:
+        return "cmpne";
+    case LirOpcode::CmpLt:
+        return "cmplt";
+    case LirOpcode::CmpLe:
+        return "cmple";
+    case LirOpcode::CmpGt:
+        return "cmpgt";
+    case LirOpcode::CmpGe:
+        return "cmpge";
+    case LirOpcode::Cast:
+        return "cast";
+    case LirOpcode::Call:
+        return "call";
+    case LirOpcode::CallIndirect:
+        return "call_ind";
+    case LirOpcode::Assert:
+        return "assert";
+    case LirOpcode::Panic:
+        return "panic";
+    case LirOpcode::FieldPtr:
+        return "fieldptr";
+    case LirOpcode::IndexPtr:
+        return "indexptr";
+    case LirOpcode::Phi:
+        return "phi";
+    case LirOpcode::GlobalAddr:
+        return "globaladdr";
+    case LirOpcode::StringAddr:
+        return "stringaddr";
+    }
+    return "?";
+}
+
 // LIR Instruction
 struct LirInstr {
     LirReg dst = LirNoReg; // result register (LirNoReg for Store)
@@ -73,7 +150,14 @@ struct LirInstr {
     std::string strArg;       // literal (Const), name (Load/Call), field (FieldPtr), from-type (Cast)
     std::vector<std::pair<LirReg, std::uint32_t>> phiPreds;  // Phi: (reg, block_index)
     CallingConvention callConv = CallingConvention::Default; // for Call instructions
-    // Optional source context used by instructions that report runtime failures.
+    bool isCVariadic = false;                                // direct call to a C-style variadic extern
+    /// A store whose only purpose is that it happens. Zeroizing a secret writes memory nothing reads afterwards, which
+    /// is exactly the shape dead-store elimination removes, so the write says so about itself.
+    bool isVolatile = false;
+    /// Present only with isCVariadic. AArch64 platform variants need the declaration boundary to promote and/or place
+    /// anonymous arguments correctly.
+    std::optional<std::uint32_t> cVariadicFixedParamCount;
+    /// Optional source context used by instructions that report runtime failures.
     std::string sourceFile;
     std::string sourceFunction;
     std::uint32_t sourceLine = 0;
@@ -88,6 +172,23 @@ enum class LirTermKind {
     Switch,
     Unreachable,
 };
+
+/// The spelling of a terminator, under the same rule as LirOpcodeName.
+[[nodiscard]] constexpr std::string_view LirTermKindName(const LirTermKind kind) noexcept {
+    switch (kind) {
+    case LirTermKind::Jump:
+        return "jump";
+    case LirTermKind::Branch:
+        return "branch";
+    case LirTermKind::Return:
+        return "ret";
+    case LirTermKind::Switch:
+        return "switch";
+    case LirTermKind::Unreachable:
+        return "unreachable";
+    }
+    return "?";
+}
 
 struct LirSwitchCase {
     std::string value;
@@ -178,8 +279,8 @@ struct LirConstDecl {
     TypeRef type;
     std::string value; // printed literal of the constant expression
 
-    // Constant sequence contents. Slice<T> publishes a {data, length} header;
-    // T[N] publishes the inline elements directly under `name`.
+    /// Constant sequence contents. Slice<T> publishes a {data, length} header; T[N] publishes the inline elements
+    /// directly under `name`.
     TypeRef elementType;
     std::vector<std::string> elements;
     std::string text;
@@ -222,5 +323,6 @@ struct LirModule {
 
 struct LirPackage {
     std::vector<LirModule> modules;
+    std::vector<DropGluePlan> dropGlues;
 };
 } // namespace Rux

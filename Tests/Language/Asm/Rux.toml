@@ -1,11 +1,14 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "Asm"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Language test: Asm"
 
 [Dependencies]
-Rux = { Path = "../../../Packages/Rux" }
+Core = { Path = "../../../Packages/Core" }
 
 [Build]
 Output = "../../../Bin/Tests/Language"

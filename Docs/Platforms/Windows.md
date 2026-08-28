@@ -21,11 +21,9 @@ Choose one of these per-user installation methods; none requires administrator a
 
 - Download `rux-windows.msi` from the [latest GitHub release](https://github.com/rux-lang/Rux/releases/latest) and run it.
 
-These automated installers currently install x86-64 Rux. On AArch64 Windows,
-download `rux-windows-aarch64.zip` from the latest release and extract
-`rux.exe` into a directory on `PATH`.
+The PowerShell installer selects the native x86-64 or AArch64 release. Scoop and the MSI currently install x86-64 Rux; on AArch64 Windows, use the PowerShell installer or download `rux-windows-aarch64.zip` directly.
 
-Open a new terminal after installation, then verify the compiler:
+Restart your terminal after installation, then verify the compiler:
 
 ```powershell
 rux version
@@ -67,10 +65,10 @@ Rux currently requires Clang 22.1 or newer, CMake 3.30 or newer, Ninja 1.11 or n
    ```powershell
    git clone https://github.com/rux-lang/Rux.git
    Set-Location Rux
-   .\Build.ps1
+   .\Run.ps1 build
    ```
 
-The script creates a Release build in `Build\` and writes the compiler to `Bin\rux.exe`.
+The command creates a Release build in `Build\` and writes the compiler to `Bin\rux.exe`.
 
 Once the repository is cloned, later sessions can replace the snippet in step 4 with the script CI uses, which performs the same initialization for the requested toolset:
 
@@ -78,10 +76,33 @@ Once the repository is cloned, later sessions can replace the snippet in step 4 
 ./.github/scripts/Enter-VsDevEnv.ps1 -Arch amd64   # arm64 on an AArch64 host
 ```
 
-`Build.ps1` selects `windows-x86_64` or `windows-aarch64` from the native host
-architecture.
+`Run.ps1 build` selects `windows-x86_64` or `windows-aarch64` from the native host architecture. Both compilers can emit Windows x86-64 and Classic Windows AArch64 programs. The AArch64 backend and PE/COFF writer produce executables, DLLs with import libraries, and static libraries in-process; no external assembler, compiler, linker, or archiver is invoked.
 
-For a Debug build, run `.\Build.ps1 -Configuration Debug`. Run `Get-Help .\Build.ps1 -Full` to see every option.
+## Cross-Compiling for Windows AArch64
+
+Pass the canonical target to build or check an AArch64 package from either compiler architecture (`windows-arm64` is accepted as an alias). Target tests are also available when the underlying Windows machine is AArch64:
+
+```powershell
+./Bin/rux.exe build --release --target windows-aarch64
+./Bin/rux.exe check --target windows-aarch64
+./Bin/rux.exe test --release --target windows-aarch64
+```
+
+Run workspace commands from the repository root; use `--manifest <path>` before the subcommand for an individual package. Every build is placed below its own operating-system and architecture directory, such as `Bin/Release/Windows/AArch64/Name.exe`, including when that target is the host.
+
+`rux build --all` also produces both Windows targets in Debug and Release; see the [matrix path and flag rules](../Builds.md#building-the-complete-matrix).
+
+`rux run` always builds and launches the compiler's host triple and does not accept `--target`. On AArch64 Windows, both a native AArch64 compiler and an x86-64 compiler process running under Windows translation can launch generated AArch64 tests directly. Rux queries the native OS architecture separately from the compiler process architecture, which is why that x86-64 `rux.exe` can run `rux test --target windows-aarch64`. On physical x86-64 Windows, `build` and `check` still work, but target tests fail before compiling the suite and direct the user to test on an AArch64 machine.
+
+GitHub's `windows-11-arm` runner is the default native and cross-target test environment. An Azure Windows 11 ARM64 VM is reserved for interactive crash dumps, prolonged debugging, or demonstrated GitHub-runner instability; it is not required for acceptance.
+
+## Native Package Artifacts
+
+An `Executable` package writes `Name.exe`, a `SharedLibrary` writes `Name.dll` plus the `Name.lib` import library, and a `StaticLibrary` writes `Name.lib`. Shared and static libraries can be built but not passed to `rux run`. `SourceLibrary` has no standalone native artifact.
+
+The x86-64 and AArch64 backends write PE/COFF objects and libraries directly, without an external toolchain. Executables prefer image base `0x140000000` and DLLs `0x180000000`, and every 64-bit absolute fixup is listed as an `IMAGE_REL_BASED_DIR64` entry in the `.reloc` table, so both PE architectures are relocatable and opt into ASLR with high-entropy addresses. That table is what lets AArch64 images launch at all: Windows on ARM64 refuses an executable or DLL it cannot relocate. ARM64 unwind metadata (`.pdata` / `.xdata`) and broader PE hardening remain follow-up work.
+
+For a Debug build, run `.\Run.ps1 build -Configuration Debug`. Run `.\Run.ps1` for the command and option summary, or `Get-Help .\Run.ps1 -Full` for the complete reference.
 
 ## Verifying the Build
 
@@ -94,13 +115,24 @@ Run the compiler:
 Run the complete repository verification workflow:
 
 ```powershell
-.\Test.ps1
+.\Run.ps1 test
 ```
 
 Static analysis is intentionally opt-in because it is slower and requires PowerShell 7 or newer:
 
 ```powershell
-.\Test.ps1 -ClangTidy
+.\Run.ps1 test -ClangTidy
 ```
 
-Use `.\Format.ps1` to format maintained C++ and Rux sources, or `.\Format.ps1 -Check` to check them without making changes.
+Use `.\Run.ps1 format` to format maintained C++ and Rux sources, or `.\Run.ps1 format -Check` to check them without making changes. Individual workflow steps are also available on their own as `.\Run.ps1 policy`, `.\Run.ps1 tidy`, and `.\Run.ps1 unit`.
+
+On AArch64 Windows, reproduce the CI cross-target coverage with an x86-64 or native compiler:
+
+```powershell
+.\Bin\rux.exe check --target windows-aarch64
+.\Bin\rux.exe test --release --target windows-aarch64
+.\Tests\Native\WindowsAArch64ExitCode\Verify.ps1 -Rux .\Bin\rux.exe
+.\Tests\Native\WindowsAArch64Assert\Verify.ps1 -Rux .\Bin\rux.exe
+.\Tests\Native\WindowsAArch64Panic\Verify.ps1 -Rux .\Bin\rux.exe
+.\Tests\Native\WindowsAArch64Dll\Verify.ps1 -Rux .\Bin\rux.exe
+```

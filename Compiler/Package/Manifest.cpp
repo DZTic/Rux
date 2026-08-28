@@ -1,309 +1,310 @@
+// Manifest loading and discovery: finding `Rux.toml`, reading it, and turning
+// a parse or encoding failure into a diagnostic that points at the line.
+
 #include "Package/Manifest.h"
 
+#include "Package/ManifestSyntax.h"
+#include "Package/ManifestValidation.h"
+
 #include <algorithm>
+#include <format>
 #include <fstream>
 #include <ranges>
+#include <sstream>
 
 namespace Rux {
-static constexpr std::string_view whitespace = " \t\r\n";
-
-static constexpr std::string_view Trim(const std::string_view s) noexcept {
-    const auto start = s.find_first_not_of(whitespace);
-    return (start == std::string_view::npos) ? "" : s.substr(start, s.find_last_not_of(whitespace) - start + 1);
-}
-
-static constexpr std::string_view Unquote(std::string_view s) noexcept {
-    s = Trim(s);
-    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
-        return s.substr(1, s.size() - 2);
-    }
-    return s;
-}
-
-// Parse a string value out of an inline table like { Path =
-// "../../Packages/Rux" }.
-static std::string ParseInlineTableString(std::string_view val, std::string_view keyName) {
-    const auto open = val.find('{');
-    const auto close = val.rfind('}');
-    if (open == std::string_view::npos || close == std::string_view::npos || close <= open) {
-        return {};
-    }
-    std::string_view inner = val.substr(open + 1, close - open - 1);
-    const auto keyPos = inner.find(keyName);
-    if (keyPos == std::string_view::npos) {
-        return {};
-    }
-    const auto eqPos = inner.find('=', keyPos + keyName.size());
-    if (eqPos == std::string_view::npos) {
-        return {};
-    }
-    std::size_t valueEnd = eqPos + 1;
-    bool inString = false;
-    while (valueEnd < inner.size()) {
-        const char c = inner[valueEnd];
-        if (c == '"') {
-            inString = !inString;
-        }
-        if (!inString && c == ',') {
-            break;
-        }
-        ++valueEnd;
-    }
-    const auto rawVal = Trim(inner.substr(eqPos + 1, valueEnd - eqPos - 1));
-    if (rawVal.size() >= 2 && rawVal.front() == '"' && rawVal.back() == '"') {
-        return std::string(rawVal.substr(1, rawVal.size() - 2));
-    }
-    return std::string(rawVal);
-}
-
-static Dependency ParseDependency(std::string key, const std::string &value) {
-    Dependency dep;
-    dep.name = std::move(key);
-    if (!value.empty() && value.front() == '{') {
-        dep.package = ParseInlineTableString(value, "Package");
-        dep.path = ParseInlineTableString(value, "Path");
-        dep.version = ParseInlineTableString(value, "Version");
-    }
-    else {
-        dep.version = value == "*" ? "" : value;
-    }
-    return dep;
-}
-
-// Split a bracketed, comma-separated list of quoted strings (which may span
-// several lines, already joined into `text`) into its entries. Package paths
-// contain no commas, so a plain comma split is sufficient.
-static void ParseStringArray(std::string_view text, std::vector<std::string> &out) {
-    const auto open = text.find('[');
-    const auto close = text.rfind(']');
-    if (open == std::string_view::npos || close == std::string_view::npos || close <= open) {
-        return;
-    }
-    std::string_view inner = text.substr(open + 1, close - open - 1);
-    std::size_t pos = 0;
-    while (pos <= inner.size()) {
-        const auto comma = inner.find(',', pos);
-        const auto end = comma == std::string_view::npos ? inner.size() : comma;
-        const auto entry = Unquote(inner.substr(pos, end - pos));
-        if (!entry.empty()) {
-            out.emplace_back(entry);
-        }
-        if (comma == std::string_view::npos) {
-            break;
-        }
-        pos = comma + 1;
-    }
-}
-
-std::pair<std::string, std::string> ParsePackageSpec(std::string_view spec) {
-    if (const auto at = spec.find('@'); at != std::string_view::npos) {
-        return {std::string(Trim(spec.substr(0, at))), std::string(Trim(spec.substr(at + 1)))};
-    }
-    return {std::string(Trim(spec)), {}};
-}
-
-std::optional<Manifest> Manifest::Load(const std::filesystem::path &path) {
-    std::ifstream file(path);
-    if (!file) {
-        return std::nullopt;
-    }
-
-    Manifest m;
-    std::string line;
-    std::string section;
-
-    while (std::getline(file, line)) {
-        std::string_view trimmed = Trim(line);
-
-        if (trimmed.empty() || trimmed.starts_with('#')) {
-            continue;
-        }
-
-        if (trimmed.starts_with('[')) {
-            if (const auto close = trimmed.find(']'); close != std::string_view::npos) {
-                section = Trim(trimmed.substr(1, close - 1));
-            }
-            continue;
-        }
-
-        const auto eq = trimmed.find('=');
-        if (eq == std::string_view::npos) {
-            continue;
-        }
-
-        const auto key = Trim(trimmed.substr(0, eq));
-        const auto value = Unquote(Trim(trimmed.substr(eq + 1)));
-
-        if (section == "Package") {
-            if (key == "Name") {
-                m.package.name = value;
-            }
-            else if (key == "Version") {
-                m.package.version = value;
-            }
-            else if (key == "Type") {
-                m.package.type = value;
-            }
-            else if (key == "Description") {
-                m.package.description = value;
-            }
-            else if (key == "Authors") {
-                std::string authorsText(Trim(trimmed.substr(eq + 1)));
-                if (authorsText.starts_with('[')) {
-                    while (authorsText.find(']') == std::string::npos && std::getline(file, line)) {
-                        authorsText.push_back(' ');
-                        authorsText.append(Trim(line));
-                    }
-                    ParseStringArray(authorsText, m.package.authors);
-                }
-                else if (!value.empty()) {
-                    // Accept legacy scalar manifests and normalize them to an
-                    // array the next time the manifest is saved.
-                    m.package.authors.emplace_back(value);
-                }
-            }
-            else if (key == "License") {
-                m.package.license = value;
-            }
-            else if (key == "Repository") {
-                m.package.repository = value;
-            }
-            else if (key == "Homepage") {
-                m.package.homepage = value;
-            }
-        }
-        else if (section == "Build") {
-            if (key == "Output") {
-                m.build.output = value;
-            }
-        }
-        else if (section == "Build.Defines") {
-            m.build.defines[std::string(key)] = value.empty() ? "true" : value;
-        }
-        else if (section == "Dependencies") {
-            m.dependencies.push_back(ParseDependency(std::string(key), std::string(value)));
-        }
-        else if (section == "Workspace") {
-            if (key == "Packages") {
-                // The array may span several lines; keep reading until the
-                // closing bracket is seen, then split the joined text.
-                std::string arrayText(Trim(trimmed.substr(eq + 1)));
-                while (arrayText.find(']') == std::string::npos && std::getline(file, line)) {
-                    arrayText.push_back(' ');
-                    arrayText.append(Trim(line));
-                }
-                ParseStringArray(arrayText, m.workspace.packages);
-            }
-        }
-    }
-
-    // A valid manifest is either a package (has a name) or a workspace
-    // (lists member packages).
-    if (m.package.name.empty() && m.workspace.packages.empty()) {
-        return std::nullopt;
-    }
-    return m;
-}
-
-bool Manifest::Save(const std::filesystem::path &path) const {
-    std::ofstream file(path);
-    if (!file) {
-        return false;
-    }
-
-    file << "[Package]\n"
-         << "Name = \"" << package.name << "\"\n"
-         << "Version = \"" << package.version << "\"\n"
-         << "Type = \"" << package.type << "\"\n";
-    if (!package.description.empty()) {
-        file << "Description = \"" << package.description << "\"\n";
-    }
-    if (!package.authors.empty()) {
-        file << "Authors = [";
-        for (std::size_t i = 0; i < package.authors.size(); ++i) {
-            if (i != 0) {
-                file << ", ";
-            }
-            file << '"' << package.authors[i] << '"';
-        }
-        file << "]\n";
-    }
-    if (!package.license.empty()) {
-        file << "License = \"" << package.license << "\"\n";
-    }
-    if (!package.repository.empty()) {
-        file << "Repository = \"" << package.repository << "\"\n";
-    }
-    if (!package.homepage.empty()) {
-        file << "Homepage = \"" << package.homepage << "\"\n";
-    }
-
-    if (!dependencies.empty()) {
-        file << "\n[Dependencies]\n";
-        for (const auto &dep : dependencies) {
-            const bool hasPackageAlias = !dep.package.empty() && dep.package != dep.name;
-            if (!dep.path.empty() || hasPackageAlias) {
-                file << dep.name << " = { ";
-                bool wrote = false;
-                if (hasPackageAlias) {
-                    file << "Package = \"" << dep.package << "\"";
-                    wrote = true;
-                }
-                if (!dep.path.empty()) {
-                    if (wrote) {
-                        file << ", ";
-                    }
-                    file << "Path = \"" << dep.path << "\"";
-                }
-                file << " }\n";
+namespace {
+/// Where a manifest first stops being valid UTF-8.
+///
+/// Checked before parsing so a binary or mis-encoded file is reported as such, rather than as a syntax error at
+/// whatever byte happened to confuse the parser.
+///
+/// @return nullopt when the whole text is well-formed
+std::optional<ManifestDetail::Location> InvalidUtf8Location(const std::string_view text) {
+    ManifestDetail::Location location;
+    for (std::size_t offset = 0; offset < text.size();) {
+        const auto lead = static_cast<unsigned char>(text[offset]);
+        if (lead < 0x80) {
+            if (lead == '\n') {
+                ++location.line;
+                location.column = 1;
             }
             else {
-                std::string ver = dep.version.empty() ? "*" : dep.version;
-                file << dep.name << " = \"" << ver << "\"\n";
+                ++location.column;
             }
+            ++offset;
+            continue;
         }
-    }
-
-    file << "\n[Build]\n"
-         << "Output = \"" << build.output << "\"\n";
-
-    if (!build.defines.empty()) {
-        file << "\n[Build.Defines]\n";
-        for (const auto &[name, value] : build.defines) {
-            file << name << " = \"" << value << "\"\n";
+        std::size_t width = 0;
+        std::uint32_t codePoint = 0;
+        std::uint32_t minimum = 0;
+        if ((lead & 0xE0U) == 0xC0U) {
+            width = 2;
+            codePoint = lead & 0x1FU;
+            minimum = 0x80;
         }
+        else if ((lead & 0xF0U) == 0xE0U) {
+            width = 3;
+            codePoint = lead & 0x0FU;
+            minimum = 0x800;
+        }
+        else if ((lead & 0xF8U) == 0xF0U) {
+            width = 4;
+            codePoint = lead & 0x07U;
+            minimum = 0x10000;
+        }
+        else {
+            return location;
+        }
+        if (offset + width > text.size()) {
+            return location;
+        }
+        for (std::size_t index = 1; index < width; ++index) {
+            const auto continuation = static_cast<unsigned char>(text[offset + index]);
+            if ((continuation & 0xC0U) != 0x80U) {
+                return location;
+            }
+            codePoint = (codePoint << 6U) | (continuation & 0x3FU);
+        }
+        if (codePoint < minimum || codePoint > 0x10FFFF || (codePoint >= 0xD800 && codePoint <= 0xDFFF)) {
+            return location;
+        }
+        offset += width;
+        location.column += static_cast<std::uint32_t>(width);
     }
-    return file.good();
+    return std::nullopt;
 }
 
-bool Manifest::AddDependency(const std::string &name, const std::string &version) {
-    if (const auto it = std::ranges::find(dependencies, name, &Dependency::name); it != dependencies.end()) {
-        if (it->version == version) {
+/// One line of the manifest, so a diagnostic can quote the line it points at.
+std::optional<std::string> SourceLineAt(const std::string_view text, const std::uint32_t wantedLine) {
+    std::uint32_t line = 1;
+    std::size_t begin = 0;
+    while (line < wantedLine) {
+        const auto newline = text.find('\n', begin);
+        if (newline == std::string_view::npos) {
+            return std::nullopt;
+        }
+        begin = newline + 1;
+        ++line;
+    }
+    auto end = text.find('\n', begin);
+    if (end == std::string_view::npos) {
+        end = text.size();
+    }
+    if (end > begin && text[end - 1] == '\r') {
+        --end;
+    }
+    return std::string(text.substr(begin, end - begin));
+}
+} // namespace
+
+std::string_view ToString(const ManifestPackageType type) noexcept {
+    switch (type) {
+    case ManifestPackageType::Executable:
+        return "Executable";
+    case ManifestPackageType::SharedLibrary:
+        return "SharedLibrary";
+    case ManifestPackageType::StaticLibrary:
+        return "StaticLibrary";
+    case ManifestPackageType::SourceLibrary:
+        return "SourceLibrary";
+    }
+    return "Executable";
+}
+
+std::optional<ManifestPackageType> ParseManifestPackageType(const std::string_view value) noexcept {
+    if (value == "Executable") {
+        return ManifestPackageType::Executable;
+    }
+    if (value == "SharedLibrary") {
+        return ManifestPackageType::SharedLibrary;
+    }
+    if (value == "StaticLibrary") {
+        return ManifestPackageType::StaticLibrary;
+    }
+    if (value == "SourceLibrary") {
+        return ManifestPackageType::SourceLibrary;
+    }
+    return std::nullopt;
+}
+
+std::string_view ManifestTargetOSName(const Target::OS os) noexcept {
+    switch (os) {
+    case Target::OS::FreeBSD:
+        return "FreeBSD";
+    case Target::OS::Linux:
+        return "Linux";
+    case Target::OS::MacOS:
+        return "macOS";
+    case Target::OS::Windows:
+        return "Windows";
+    default:
+        return "";
+    }
+}
+
+std::optional<Target::OS> ParseManifestTargetOS(const std::string_view value) noexcept {
+    constexpr Target::OS supported[] = {Target::OS::FreeBSD, Target::OS::Linux, Target::OS::MacOS, Target::OS::Windows};
+    for (const Target::OS os : supported) {
+        if (ManifestTargetOSName(os) == value) {
+            return os;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string ManifestDiagnostic::Format() const {
+    return std::format("{}:{}:{}: {}", path.string(), line, column, message);
+}
+
+std::string ManifestDiagnostic::Render() const {
+    std::string rendered = std::format("{}:{}:{}: error: {}\n", path.string(), line, column, message);
+    if (sourceLine) {
+        const std::size_t caret = std::min<std::size_t>(column > 0 ? column - 1 : 0, sourceLine->size());
+        rendered += std::format("  {} | {}\n", line, *sourceLine);
+        rendered += std::string(std::to_string(line).size() + 5 + caret, ' ') + "^\n";
+    }
+    for (const auto &note : notes) {
+        rendered += "  note: " + note + '\n';
+    }
+    if (help) {
+        rendered += "  help: " + *help + '\n';
+    }
+    if (documentationUrl) {
+        rendered += "  docs: " + *documentationUrl + '\n';
+    }
+    return rendered;
+}
+
+const std::string &ManifestDependency::Path() const noexcept {
+    static const std::string none;
+    if (const auto *local = std::get_if<PathDependencySource>(&source)) {
+        return local->path;
+    }
+    return none;
+}
+
+bool ManifestDependency::MatchesTarget(const Target::OS os) const noexcept {
+    return targetOS.empty() || std::ranges::contains(targetOS, os);
+}
+
+std::map<std::string, std::string> Build::ConfigValues() const {
+    std::map<std::string, std::string> values;
+    for (const auto &[name, value] : defines) {
+        values.emplace(name, value.text);
+    }
+    return values;
+}
+
+ManifestResult Manifest::Parse(const std::string_view text, const std::filesystem::path &path) {
+    ManifestResult result;
+    if (text.size() > manifestMaxBytes) {
+        result.diagnostics.push_back({path,
+                                      1,
+                                      1,
+                                      std::format("manifest is larger than {} bytes", manifestMaxBytes),
+                                      {},
+                                      "reduce the manifest size",
+                                      std::string(manifestDocumentationUrl),
+                                      {}});
+        return result;
+    }
+
+    if (const auto invalid = InvalidUtf8Location(text)) {
+        result.diagnostics.push_back({path,
+                                      invalid->line,
+                                      invalid->column,
+                                      "manifest contains invalid UTF-8",
+                                      {},
+                                      "save the manifest as valid UTF-8",
+                                      std::string(manifestDocumentationUrl),
+                                      SourceLineAt(text, invalid->line)});
+        return result;
+    }
+
+    auto syntax = ManifestDetail::ParseManifestSyntax(text);
+    if (!syntax) {
+        result.diagnostics.push_back({path,
+                                      syntax.error().location.line,
+                                      syntax.error().location.column,
+                                      syntax.error().message,
+                                      {},
+                                      "use the supported TOML syntax described in the manifest reference",
+                                      std::string(manifestDocumentationUrl),
+                                      SourceLineAt(text, syntax.error().location.line)});
+        return result;
+    }
+
+    auto validation = ManifestDetail::ValidateManifestV1All(std::move(*syntax));
+    if (!validation.Ok()) {
+        for (auto &diagnostic : validation.diagnostics) {
+            result.diagnostics.push_back({path,
+                                          diagnostic.location.line,
+                                          diagnostic.location.column,
+                                          std::move(diagnostic.message),
+                                          {},
+                                          std::move(diagnostic.help),
+                                          std::move(diagnostic.documentationUrl),
+                                          SourceLineAt(text, diagnostic.location.line)});
+        }
+        return result;
+    }
+    result.manifest = std::move(*validation.manifest);
+    return result;
+}
+
+ManifestResult Manifest::Load(const std::filesystem::path &path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        ManifestResult result;
+        result.diagnostics.push_back(
+            {path, 1, 1, "could not open the manifest", {}, "check that the path exists and is readable", {}, {}});
+        return result;
+    }
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    return Parse(contents.str(), path);
+}
+
+const ManifestDependency *Manifest::FindDependency(const IdentitySegment &importName) const {
+    const auto found = std::ranges::find(dependencies, importName, &ManifestDependency::importName);
+    return found == dependencies.end() ? nullptr : &*found;
+}
+
+bool Manifest::AddRegistryDependency(IdentitySegment importName, IdentitySegment ns, VersionRange version) {
+    RegistryDependencySource source{std::move(ns), std::move(version)};
+    const auto found = std::ranges::find(dependencies, importName, &ManifestDependency::importName);
+    if (found != dependencies.end()) {
+        const auto *existing = found->Registry();
+        if (existing != nullptr && existing->ns == source.ns && existing->version.Text() == source.version.Text() &&
+            found->package == importName) {
             return false;
         }
-        it->version = version;
-        it->path.clear();
+        found->package = importName;
+        found->source = std::move(source);
         return true;
     }
-    dependencies.push_back({name, {}, version, {}});
+    dependencies.push_back({importName, importName, std::move(source), {}});
     return true;
 }
 
-bool Manifest::AddPathDependency(const std::string &name, const std::string &path) {
-    if (const auto it = std::ranges::find(dependencies, name, &Dependency::name); it != dependencies.end()) {
-        if (it->path == path) {
+bool Manifest::AddPathDependency(IdentitySegment importName, std::string path) {
+    const auto found = std::ranges::find(dependencies, importName, &ManifestDependency::importName);
+    if (found != dependencies.end()) {
+        if (found->IsPath() && found->Path() == path && found->package == importName) {
             return false;
         }
-        it->version.clear();
-        it->path = path;
+        found->package = importName;
+        found->source = PathDependencySource{std::move(path)};
         return true;
     }
-    dependencies.push_back({name, {}, {}, path});
+    dependencies.push_back({importName, importName, PathDependencySource{std::move(path)}, {}});
     return true;
 }
 
-bool Manifest::RemoveDependency(const std::string &name) {
-    return std::erase_if(dependencies, [&](const Dependency &d) { return d.name == name; }) > 0;
+bool Manifest::RemoveDependency(const IdentitySegment &importName) {
+    return std::erase_if(dependencies,
+                         [&](const ManifestDependency &dependency) { return dependency.importName == importName; }) > 0;
 }
 
 std::optional<std::filesystem::path> Manifest::Find(const std::filesystem::path &start) {
@@ -321,6 +322,12 @@ std::optional<std::filesystem::path> Manifest::Find(const std::filesystem::path 
     }
 
     return std::nullopt;
+}
+
+bool IsIntrinsicsPackage(const Manifest &manifest) {
+    return !manifest.IsWorkspace() && manifest.package.ns &&
+           manifest.package.ns->Normalized() == NormalizeIdentity(intrinsicsPackageNamespace) &&
+           manifest.package.name.Normalized() == NormalizeIdentity(intrinsicsPackageName);
 }
 
 std::vector<std::filesystem::path> DiscoverManifestlessWorkspaceManifests(const std::filesystem::path &root) {
@@ -375,5 +382,62 @@ std::vector<std::filesystem::path> DiscoverManifestlessWorkspaceManifests(const 
     const auto duplicates = std::ranges::unique(manifests);
     manifests.erase(duplicates.begin(), duplicates.end());
     return manifests;
+}
+
+std::expected<PackageSpec, PackageProblem> ParsePackageSpec(const std::string_view spec) {
+    std::string_view rest = spec;
+    PackageSpec parsed;
+
+    const auto identityProblem = [](const std::string_view role, const std::string_view value,
+                                    const IdentityError &error) {
+        return PackageProblem{DescribeIdentity(role, value, error), {std::string(identitySegmentConstraint)}, {}};
+    };
+
+    if (const auto at = rest.find('@'); at != std::string_view::npos) {
+        if (rest.find('@', at + 1) != std::string_view::npos) {
+            return std::unexpected(
+                PackageProblem{std::format("package specification '{}' contains more than one '@' separator", spec),
+                               {"a package specification has at most one version requirement"},
+                               {}});
+        }
+        const std::string_view requirement = rest.substr(at + 1);
+        if (requirement.empty()) {
+            return std::unexpected(
+                PackageProblem{std::format("package specification '{}' has no requirement after '@'", spec),
+                               {"version requirements use Semantic Versioning ranges"},
+                               {}});
+        }
+        auto range = VersionRange::Parse(requirement);
+        if (!range) {
+            return std::unexpected(PackageProblem{DescribeVersion("version requirement", requirement, range.error()),
+                                                  {"requirements use forms such as '^1.2.0' or '>=1.0.0, <2.0.0'"},
+                                                  {}});
+        }
+        parsed.version = std::move(*range);
+        rest = rest.substr(0, at);
+    }
+
+    std::string_view nameText = rest;
+    if (const auto slash = rest.find('/'); slash != std::string_view::npos) {
+        if (rest.find('/', slash + 1) != std::string_view::npos) {
+            return std::unexpected(
+                PackageProblem{std::format("package specification '{}' contains more than one '/' separator", spec),
+                               {"registry identities use exactly 'namespace/package'"},
+                               {}});
+        }
+        auto ns = IdentitySegment::Parse(rest.substr(0, slash));
+        if (!ns) {
+            return std::unexpected(identityProblem("namespace", rest.substr(0, slash), ns.error()));
+        }
+        parsed.ns = std::move(*ns);
+        nameText = rest.substr(slash + 1);
+    }
+
+    auto name = IdentitySegment::Parse(nameText);
+    if (!name) {
+        return std::unexpected(identityProblem("package name", nameText, name.error()));
+    }
+    parsed.name = std::move(*name);
+    return parsed;
 }
 } // namespace Rux

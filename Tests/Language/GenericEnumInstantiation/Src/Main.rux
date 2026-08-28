@@ -1,0 +1,47 @@
+import Core::{ Assert, Option };
+
+// `Option<V>` is named only inside a generic body. The concrete `Option<Tracked>` instantiation therefore has to
+// receive its layout and destruction glue through substitution rather than from a concrete source declaration.
+
+struct Tracked {
+    counter: *var int32;
+}
+
+extend Tracked {
+    func =(self: &var Tracked, other: &Tracked);
+
+    func ~Tracked(self: &var Tracked) {
+        if self.counter != null {
+            *self.counter += 1i32;
+        }
+    }
+}
+
+struct Shelf<K, V> {
+    held: Option<V>;
+    label: K;
+}
+
+extend Shelf<K, V> {
+    func Shelf(label: K, value: V) -> Shelf<K, V> {
+        return Shelf<K, V> { held: Option::Some<V>(<-value), label: label };
+    }
+}
+
+func Hold(counter: *var int32) {
+    let shelf = Shelf<int32, Tracked>(1i32, Tracked { counter: counter });
+    match shelf.held {
+        .Some(_) => {
+        },
+        .None => {
+            Assert(false, "the generic constructor stored its value");
+        }
+    }
+}
+
+func Main() -> int {
+    var counter = 0i32;
+    Hold(@counter);
+    Assert(counter == 1i32, "a generic enum payload receives destruction glue after substitution");
+    return 0;
+}

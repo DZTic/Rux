@@ -42,7 +42,7 @@ struct PathTypeExpr : TypeExpr {
     std::vector<std::string> segments;
 };
 
-// Inline arrays: T[] is a flexible struct tail and T[N] has a fixed extent.
+/// Inline arrays: T[] is a flexible struct tail and T[N] has a fixed extent.
 struct ArrayTypeExpr : TypeExpr {
     ~ArrayTypeExpr() override;
 
@@ -56,6 +56,12 @@ struct PointerTypeExpr : TypeExpr {
     bool pointeeMut = false; // *var T: the pointee is writable (default is read-only)
 };
 
+// &T  or  &var T
+struct ReferenceTypeExpr : TypeExpr {
+    TypeExprPtr pointee;
+    bool pointeeMut = false; // &var T: the referent is writable (default is read-only)
+};
+
 // (int32, float64)
 struct TupleTypeExpr : TypeExpr {
     std::vector<TypeExprPtr> elements;
@@ -64,9 +70,10 @@ struct TupleTypeExpr : TypeExpr {
 // self used as a type (interface method params)
 struct SelfTypeExpr : TypeExpr {};
 
-// func(x: int32, y: int32) -> bool
-// Parameter names are optional and for readability only; only the parameter
-// types and the return type participate in type identity.
+/// func(x: int32, y: int32) -> bool
+///
+/// Parameter names are optional and for readability only; only the parameter types and the return type participate in
+/// type identity.
 struct FunctionTypeExpr : TypeExpr {
     std::vector<TypeExprPtr> params;
     std::optional<TypeExprPtr> returnType; // nullopt => no return value (opaque)
@@ -115,7 +122,7 @@ struct EnumPattern : Pattern {
         PatternPtr pattern;
     };
 
-    // ["Event", "Click"] for a full pattern; ["Click"] for shorthand.
+    /// ["Event", "Click"] for a full pattern; ["Click"] for shorthand.
     std::vector<std::string> path;
     std::vector<PatternPtr> args; // bound positions
     std::vector<NamedArg> namedArgs;
@@ -171,18 +178,27 @@ struct PathExpr : Expr {
 };
 
 // sizeof(T)
-struct SizeOfExpr : Expr {
+/// `sizeof(T)` and `alignof(T)`
+///
+/// A compile-time query about a type's layout. Both fold to an unsigned constant during analysis, so neither reaches
+/// code generation as an operation.
+struct TypeQueryExpr : Expr {
+    enum class Query {
+        Size,
+        Alignment
+    };
+
+    Query query = Query::Size;
     TypeExprPtr type;
 };
 
-// .Windows — an enum variant named without its type, which the surrounding
-// context supplies. Currently the context is a `#if` condition, where the
-// variant is matched against the enum on the other side of the comparison.
+/// .Windows — an enum variant named without its type, which the surrounding context supplies. Currently the context is
+/// a `#if` condition, where the variant is matched against the enum on the other side of the comparison.
 struct EnumShorthandExpr : Expr {
     std::string variant;
 };
 
-// A compiler-provided value such as #source.line, #target.arch or #config.Get("name").
+/// A compiler-provided value such as #source.line, #target.arch or #config.Get("name").
 struct IntrinsicExpr : Expr {
     enum class Kind {
         Line,
@@ -227,20 +243,33 @@ struct UnaryExpr : Expr {
     ExprPtr operand;
 };
 
+/// `<-value` -- an explicit ownership transfer used where the destination is supplied by the surrounding expression.
+struct MoveExpr : Expr {
+    ExprPtr operand;
+};
+
+/// `expr?`
+///
+/// Propagate a failure: the expression evaluates to the success payload, and a failure returns from the enclosing
+/// function unchanged. Written tight against its operand, which is what separates it from the conditional operator.
+struct TryExpr : Expr {
+    ExprPtr operand;
+};
+
 // i++, i--
 struct PostfixExpr : Expr {
     TokenKind op; // PlusPlus or MinusMinus
     ExprPtr operand;
 };
 
-// a + b, a && b, a == b, etc.
+/// a + b, a && b, a == b, etc.
 struct BinaryExpr : Expr {
     TokenKind op;
     ExprPtr left;
     ExprPtr right;
 };
 
-// a = b, a += b, etc.
+/// a = b, a <- b, a += b, etc.
 struct AssignExpr : Expr {
     TokenKind op;
     ExprPtr target;
@@ -360,11 +389,9 @@ struct LetStmt : Stmt {
     ExprPtr init;
 };
 
-// if cond { } else if cond { } else { }
-// `when` sets isCompileTime: the conditions are folded during compilation and
-// only the taken branch reaches semantic analysis; the others are discarded
-// without being type-checked. A compile-time chain spells every arm `when`, so
-// `elseIfs` holds `else when` arms.
+/// if cond { } else if cond { } else { } `when` sets isCompileTime: the conditions are folded during compilation and
+/// only the taken branch reaches semantic analysis; the others are discarded without being type-checked. A compile-time
+/// chain spells every arm `when`, so `elseIfs` holds `else when` arms.
 struct IfStmt : Stmt {
     bool isCompileTime = false;
     ExprPtr condition;
@@ -379,12 +406,10 @@ struct IfStmt : Stmt {
     std::vector<ElseIf> elseIfs;
     std::unique_ptr<Block> elseBlock; // null if no else
 
-    // Compile-time match form `when subject { patterns => block, ... else =>
-    // block }` (always with isCompileTime). `matchSubject` is the value being
-    // matched, and `matchArms` replaces the if/else-if fields: each arm holds a
-    // list of pattern expressions (an arm is taken when any matches) and a block;
-    // an arm with no patterns is the `else`. If no arm matches and there is no
-    // `else`, the fold reports an error.
+    /// Compile-time match form `when subject { patterns => block, ... else => block }` (always with isCompileTime).
+    /// `matchSubject` is the value being matched, and `matchArms` replaces the if/else-if fields: each arm holds a list
+    /// of pattern expressions (an arm is taken when any matches) and a block; an arm with no patterns is the `else`. If
+    /// no arm matches and there is no `else`, the fold reports an error.
     struct MatchArm {
         SourceLocation location;
         std::vector<ExprPtr> patterns; // empty = the `else` arm
@@ -435,6 +460,11 @@ struct MatchStmt : Stmt {
     std::vector<Arm> arms;
 };
 
+// defer stmt; or defer { ... }
+struct DeferStmt : Stmt {
+    StmtPtr deferredStmt;
+};
+
 // return [expr];
 struct ReturnStmt : Stmt {
     std::optional<ExprPtr> value;
@@ -460,14 +490,14 @@ struct DeclStmt : Stmt {
 struct Decl {
     SourceLocation location;
     bool isPublic = false;
-    // Non-empty for declarations whose implementation/value is supplied by
-    // the compiler rather than Rux source: the `intrinsic` keyword sets it to
-    // the registry key derived from the declaration itself (see ParseDecl).
+    std::string documentation;
+    /// Non-empty for declarations whose implementation/value is supplied by the compiler rather than Rux source: the
+    /// `intrinsic` keyword sets it to the registry key derived from the declaration itself (see ParseDecl).
     std::string intrinsicName;
     std::string warnMessage;  // non-empty = emit this warning at each call site
     std::string errorMessage; // non-empty = emit this error at each call site
-    // Lint rules explicitly suppressed for this declaration. A type-level
-    // suppression also covers the fields and variants owned by that type.
+    /// Lint rules explicitly suppressed for this declaration. A type-level suppression also covers the fields and
+    /// variants owned by that type.
     std::vector<std::string> allowedLints;
     virtual ~Decl() = default;
 };
@@ -476,18 +506,52 @@ struct Param {
     SourceLocation location;
     std::string name;
     TypeExprPtr type;
-    bool isMut = false;      // `var name: T`; parameters are immutable by default
     bool isVariadic = false; // for extern ...
     std::optional<ExprPtr> defaultValue;
+
+    /// The method receiver, written `self: T`, `self: *T` or `self: *var T`. A first parameter spelled this way is what
+    /// makes a `func` inside an `extend` block a method rather than an associated function.
+    [[nodiscard]] bool IsReceiver() const {
+        return name == "self";
+    }
 };
 
-// when cond { decls } else when cond { decls } else { decls }
-// Conditional compilation at declaration level. The taken branch's items are
-// spliced into the enclosing declaration list before semantic analysis, so no
-// later stage ever sees this node.
+/// Bounds written after one generic parameter, as in `T: Display + Debug`. Resolution deliberately happens after
+/// parsing: each entry retains its source type expression so semantic analysis can distinguish unknown types,
+/// non-interface types, and valid interface declarations at the original spelling.
+struct TypeParameter {
+    SourceLocation location;
+    std::string name;
+    std::vector<TypeExprPtr> bounds;
+};
+
+/// Project the names needed by semantic and lowering code that does not consume bounds yet. L10 validates the bound
+/// expressions and L11 replaces this projection at the HIR boundary with resolved constraint evidence.
+[[nodiscard]] inline std::vector<std::string> TypeParameterNames(const std::vector<TypeParameter> &parameters) {
+    std::vector<std::string> names;
+    names.reserve(parameters.size());
+    for (const TypeParameter &parameter : parameters) {
+        names.push_back(parameter.name);
+    }
+    return names;
+}
+
+/// Append names without exposing constraint storage to a stage that still models generic parameters symbolically.
+inline void AppendTypeParameterNames(std::vector<std::string> &destination,
+                                     const std::vector<TypeParameter> &parameters) {
+    destination.reserve(destination.size() + parameters.size());
+    for (const TypeParameter &parameter : parameters) {
+        destination.push_back(parameter.name);
+    }
+}
+
+/// when cond { decls } else when cond { decls } else { decls }
+///
+/// Conditional compilation at declaration level. The taken branch's items are spliced into the enclosing declaration
+/// list before semantic analysis, so no later stage ever sees this node.
 struct WhenDecl : Decl {
-    // A `#Error`/`#Warn` directive used as a match arm body at declaration level
-    // (`else => #Error("...")`): it emits its diagnostic when the arm is taken.
+    /// A `#Error`/`#Warn` directive used as a match arm body at declaration level (`else => #Error("...")`): it emits
+    /// its diagnostic when the arm is taken.
     enum class Directive {
         None,
         Error,
@@ -499,9 +563,8 @@ struct WhenDecl : Decl {
         ExprPtr condition; // null for the trailing `else`
         std::vector<DeclPtr> items;
 
-        // Match form only: the arm patterns compared against `matchSubject` (the
-        // arm is taken when any matches; empty for the `else` arm). `condition`
-        // is unused in that case.
+        /// Match form only: the arm patterns compared against `matchSubject` (the arm is taken when any matches; empty
+        /// for the `else` arm). `condition` is unused in that case.
         std::vector<ExprPtr> patterns;
         Directive directive = Directive::None;
         std::string directiveMessage;
@@ -510,33 +573,39 @@ struct WhenDecl : Decl {
 
     std::vector<Branch> branches;
 
-    // When set, this is the compile-time match form; each branch's `pattern`
-    // is compared against it. See IfStmt::matchSubject.
+    /// When set, this is the compile-time match form; each branch's `pattern` is compared against it. See
+    /// IfStmt::matchSubject.
     ExprPtr matchSubject;
 };
 
-// func [asm] Name<T>(params) -> Type { body }
-// body is null for interface method signatures
+/// func [asm] Name<T>(params) -> Type { body } body is null for interface method signatures
 struct FuncDecl : Decl {
     bool isAsm = false;
     bool isNoReturn = false;
     CallingConvention callConv = CallingConvention::Default;
     std::string name;
-    std::vector<std::string> typeParams;
+    std::vector<TypeParameter> typeParams;
     std::vector<Param> params;
     std::optional<TypeExprPtr> returnType;
     std::unique_ptr<Block> body;   // null = signature only
     std::vector<AsmInstr> asmBody; // instructions when isAsm; body is null
+
+    /// The declared receiver, always written first. Null for a plain function and for an associated function, which is
+    /// a `func` inside an `extend` block that takes no receiver and is called as `Type::Func(...)`.
+    [[nodiscard]] const Param *Receiver() const {
+        return !params.empty() && params.front().IsReceiver() ? &params.front() : nullptr;
+    }
 };
 
 // struct Name { field: Type; ... }
 struct StructDecl : Decl {
     std::string name;
-    std::vector<std::string> typeParams;
+    std::vector<TypeParameter> typeParams;
 
     struct Field {
         SourceLocation location;
         bool isPublic = false;
+        std::string documentation;
         std::string name;
         TypeExprPtr type;
     };
@@ -547,16 +616,18 @@ struct StructDecl : Decl {
 // enum Name<T> { Variant, Variant(Type, ...), ... }
 struct EnumDecl : Decl {
     std::string name;
-    std::vector<std::string> typeParams;
+    std::vector<TypeParameter> typeParams;
     TypeExprPtr baseType;
 
     struct Variant {
         SourceLocation location;
+        std::string documentation;
         std::string name;
         std::vector<TypeExprPtr> fields; // empty = unit variant
 
         struct NamedField {
             SourceLocation location;
+            std::string documentation;
             std::string name;
             TypeExprPtr type;
         };
@@ -574,6 +645,8 @@ struct UnionDecl : Decl {
 
     struct Field {
         SourceLocation location;
+        bool isPublic = false;
+        std::string documentation;
         std::string name;
         TypeExprPtr type;
     };
@@ -587,19 +660,18 @@ struct InterfaceDecl : Decl {
     std::vector<std::unique_ptr<FuncDecl>> methods;
 };
 
-// extend TypeName [for InterfaceName] { func ... }
-// TypeName may be a compound type such as a slice (int[]); `typeName` holds the
-// canonical string key used for method lookup, while `extendedType` preserves
-// the full type expression so semantic analysis can recover the receiver type.
+/// extend TypeName [for InterfaceName] { func ... }
+///
+/// TypeName may be a compound type such as a slice (int[]); `typeName` holds the canonical string key used for method
+/// lookup, while `extendedType` preserves the full type expression so semantic analysis can recover the receiver type.
 struct ImplDecl : Decl {
     std::string typeName;
     TypeExprPtr extendedType;
     std::optional<std::string> interfaceName;
     std::vector<std::unique_ptr<FuncDecl>> methods;
 
-    // `when` chains written between the methods. Conditional compilation folds
-    // each one and moves the methods of the taken branch into `methods`, so by
-    // the time anything else looks at an ImplDecl this is empty.
+    /// `when` chains written between the methods. Conditional compilation folds each one and moves the methods of the
+    /// taken branch into `methods`, so by the time anything else looks at an ImplDecl this is empty.
     std::vector<std::unique_ptr<WhenDecl>> conditionals;
 };
 
@@ -622,9 +694,8 @@ struct UseDecl : Decl {
     std::vector<std::string> names; // for Multi
 };
 
-// const Name[: Type] = expr;
-// `intrinsic #name: Type;` has no value: `intrinsicName` names the
-// compiler-supplied one, and is the only thing marking it.
+/// const Name[: Type] = expr; `intrinsic #name: Type;` has no value: `intrinsicName` names the compiler-supplied one,
+/// and is the only thing marking it.
 struct ConstDecl : Decl {
     std::string name;
     std::optional<TypeExprPtr> type;
@@ -642,11 +713,11 @@ struct ExternFuncDecl : Decl {
     std::string name;
     bool isNoReturn = false;
     std::string dll;
-    // A compile-time string constant used as the first #Link argument. The
-    // conditional-compilation pass resolves it into `dll` after `when` folds.
+    /// A compile-time string constant used as the first #Link argument. The conditional-compilation pass resolves it
+    /// into `dll` after `when` folds.
     std::string dllConst;
-    // The optional second #Link argument: the name to import from the DLL when it differs from
-    // the Rux-visible `name`. Empty means the two are the same.
+    /// The optional second #Link argument: the name to import from the DLL when it differs from the Rux-visible `name`.
+    /// Empty means the two are the same.
     std::string symbolName;
     std::string symbolNameConst;
     CallingConvention callConv = CallingConvention::Default;

@@ -13,8 +13,51 @@ namespace Rux {
 // Dump
 static std::string PrintPattern(const HirPattern &pat);
 static std::string PrintExpr(const HirExpr &expr);
+static std::string PrintExprCore(const HirExpr &expr);
+
+static std::string PartialDropName(const HirPartialDropAction &action) {
+    switch (action.kind) {
+    case HirPartialDropAction::Kind::Field:
+        return "field:" + action.name;
+    case HirPartialDropAction::Kind::Element:
+        return std::format("element:{}", action.ordinal);
+    case HirPartialDropAction::Kind::TupleElement:
+        return std::format("tuple:{}", action.ordinal);
+    case HirPartialDropAction::Kind::EnumPayload:
+        return action.name.empty() ? std::format("payload:{}", action.ordinal) : "payload:" + action.name;
+    }
+    return "component";
+}
+
+static std::string PrintFailureCleanups(const std::vector<HirFailureCleanup> &edges) {
+    std::string text;
+    for (std::size_t edge = 0; edge < edges.size(); ++edge) {
+        if (edges[edge].empty()) {
+            continue;
+        }
+        text += text.empty() ? " rollback{" : ", ";
+        text += std::format("{}:[", edge);
+        for (std::size_t action = 0; action < edges[edge].size(); ++action) {
+            if (action != 0) {
+                text += ", ";
+            }
+            text += PartialDropName(edges[edge][action]);
+        }
+        text += "]";
+    }
+    return text.empty() ? text : text + "}";
+}
 
 static std::string PrintExpr(const HirExpr &expr) {
+    std::string text = PrintExprCore(expr);
+    if (expr.consumption) {
+        const std::string binding = expr.consumedBindingId == 0 ? "" : std::format(", #{}", expr.consumedBindingId);
+        text = std::format("move<{}{}>({})", ValueConsumptionKindName(*expr.consumption), binding, text);
+    }
+    return text;
+}
+
+static std::string PrintExprCore(const HirExpr &expr) {
     if (auto *e = dynamic_cast<const HirLiteralExpr *>(&expr)) {
         return e->value;
     }
@@ -43,8 +86,20 @@ static std::string PrintExpr(const HirExpr &expr) {
     if (auto *e = dynamic_cast<const HirBinaryExpr *>(&expr)) {
         return std::format("({} {} {})", PrintExpr(*e->left), OpStr(e->op), PrintExpr(*e->right));
     }
+    if (auto *e = dynamic_cast<const HirCopyExpr *>(&expr)) {
+        const std::string operation = e->plan.customCallee.empty() ? "generated" : e->plan.customCallee;
+        return std::format("copy<{}>({})", operation, PrintExpr(*e->value));
+    }
+    if (auto *e = dynamic_cast<const HirMoveExpr *>(&expr)) {
+        const std::string operation = e->plan.customCallee.empty() ? "generated" : e->plan.customCallee;
+        return std::format("move-construct<{}>({})", operation, PrintExpr(*e->value));
+    }
     if (auto *e = dynamic_cast<const HirAssignExpr *>(&expr)) {
-        return std::format("{} {} {}", PrintExpr(*e->target), OpStr(e->op), PrintExpr(*e->value));
+        std::string assignment = std::format("{} {} {}", PrintExpr(*e->target), OpStr(e->op), PrintExpr(*e->value));
+        if (e->overwriteCleanup) {
+            assignment = std::format("overwrite<{}>({})", e->overwriteCleanup->glueSymbol, assignment);
+        }
+        return assignment;
     }
     if (auto *e = dynamic_cast<const HirTernaryExpr *>(&expr)) {
         return std::format("{} ? {} : {}", PrintExpr(*e->condition), PrintExpr(*e->thenExpr), PrintExpr(*e->elseExpr));
@@ -78,7 +133,7 @@ static std::string PrintExpr(const HirExpr &expr) {
             }
             s += e->fields[i].name + ": " + PrintExpr(*e->fields[i].value);
         }
-        return s + " }";
+        return s + " }" + PrintFailureCleanups(e->failureCleanups);
     }
     if (auto *e = dynamic_cast<const HirArrayExpr *>(&expr)) {
         std::string s = "[";
@@ -88,7 +143,7 @@ static std::string PrintExpr(const HirExpr &expr) {
             }
             s += PrintExpr(*e->elements[i]);
         }
-        return s + "]";
+        return s + "]" + PrintFailureCleanups(e->failureCleanups);
     }
     if (auto *e = dynamic_cast<const HirTupleExpr *>(&expr)) {
         std::string s = "(";
@@ -98,7 +153,7 @@ static std::string PrintExpr(const HirExpr &expr) {
             }
             s += PrintExpr(*e->elements[i]);
         }
-        return s + ")";
+        return s + ")" + PrintFailureCleanups(e->failureCleanups);
     }
     if (auto *e = dynamic_cast<const HirCastExpr *>(&expr)) {
         return std::format("{} as {}", PrintExpr(*e->operand), e->targetType.ToString());
@@ -124,7 +179,7 @@ static std::string PrintExpr(const HirExpr &expr) {
             }
             s += PrintExpr(*e->payloads[i]);
         }
-        return s + ")#" + e->discriminant;
+        return s + ")#" + e->discriminant + PrintFailureCleanups(e->failureCleanups);
     }
     if (dynamic_cast<const HirBlockExpr *>(&expr)) {
         return "{ ... }";
@@ -198,6 +253,13 @@ static void DumpBlock(std::ostream &out, const HirBlock &block, const std::strin
 
 static void DumpStmt(std::ostream &out, const HirStmt &stmt, const std::string &indent);
 
+static void DumpCleanups(std::ostream &out, const std::vector<HirDropAction> &cleanups, const std::string &indent) {
+    for (const auto &cleanup : cleanups) {
+        out << std::format("{}drop-if-live #{} {}: {} using {}\n", indent, cleanup.bindingId, cleanup.name,
+                           cleanup.type.ToString(), cleanup.glueSymbol);
+    }
+}
+
 static void DumpBlock(std::ostream &out, const HirBlock &block, const std::string &indent) {
     for (const auto &stmt : block.stmts) {
         DumpStmt(out, *stmt, indent);
@@ -216,6 +278,11 @@ static void DumpStmt(std::ostream &out, const HirStmt &stmt, const std::string &
             out << " = " << PrintExpr(*s->init);
         }
         out << '\n';
+        return;
+    }
+    if (auto *s = dynamic_cast<const HirDropStmt *>(&stmt)) {
+        out << std::format("{}drop-if-live #{} {}: {} using {}\n", indent, s->action.bindingId, s->action.name,
+                           s->action.type.ToString(), s->action.glueSymbol);
         return;
     }
     if (auto *s = dynamic_cast<const HirIfStmt *>(&stmt)) {
@@ -252,11 +319,17 @@ static void DumpStmt(std::ostream &out, const HirStmt &stmt, const std::string &
         DumpBlock(out, s->body, indent + "  ");
         return;
     }
+    if (auto *s = dynamic_cast<const HirScopeStmt *>(&stmt)) {
+        out << indent << "scope\n";
+        DumpBlock(out, s->block, indent + "  ");
+        return;
+    }
     if (auto *s = dynamic_cast<const HirMatchStmt *>(&stmt)) {
         out << std::format("{}match {}\n", indent, PrintExpr(*s->subject));
         for (const auto &arm : s->arms) {
             out << std::format("{}  {} =>\n", indent, PrintPattern(*arm.pattern));
             out << std::format("{}    {}\n", indent, PrintExpr(*arm.body));
+            DumpCleanups(out, arm.cleanups, indent + "    ");
         }
         return;
     }
@@ -267,14 +340,17 @@ static void DumpStmt(std::ostream &out, const HirStmt &stmt, const std::string &
         else {
             out << indent << "return\n";
         }
+        DumpCleanups(out, s->cleanups, indent + "  ");
         return;
     }
     if (auto *s = dynamic_cast<const HirBreakStmt *>(&stmt)) {
         out << indent << (s->label.empty() ? "break" : "break " + s->label) << "\n";
+        DumpCleanups(out, s->cleanups, indent + "  ");
         return;
     }
     if (auto *s = dynamic_cast<const HirContinueStmt *>(&stmt)) {
         out << indent << (s->label.empty() ? "continue" : "continue " + s->label) << "\n";
+        DumpCleanups(out, s->cleanups, indent + "  ");
         return;
     }
     if (auto *s = dynamic_cast<const HirLocalDecl *>(&stmt)) {
@@ -288,7 +364,7 @@ static void DumpFuncSignature(std::ostream &out, const HirFunc &f, const std::st
         out << prefix << "#NoReturn()\n";
     }
     std::string pub = f.isPublic ? "pub " : "";
-    std::string asm_ = f.isAsm ? "asm " : "";
+    std::string asmPrefix = f.isAsm ? "asm " : "";
     std::string tps;
     if (!f.typeParams.empty()) {
         tps = "<";
@@ -313,8 +389,43 @@ static void DumpFuncSignature(std::ostream &out, const HirFunc &f, const std::st
         }
     }
     std::string ret = f.returnType.IsOpaque() ? "" : " -> " + f.returnType.ToString();
-    out << std::format("{}{}{}func {}{}{}{}\n", prefix, pub, asm_, f.name, tps,
+    out << std::format("{}{}{}func {}{}{}{}\n", prefix, pub, asmPrefix, f.name, tps,
                        params.empty() ? "()" : "(" + params + ")", ret);
+}
+
+static std::string_view DropGlueKindName(const DropGlueStep::Kind kind) {
+    switch (kind) {
+    case DropGlueStep::Kind::InvokeDrop:
+        return "invoke-drop";
+    case DropGlueStep::Kind::Field:
+        return "field";
+    case DropGlueStep::Kind::TupleElement:
+        return "tuple-element";
+    case DropGlueStep::Kind::ArrayElements:
+        return "array-elements";
+    case DropGlueStep::Kind::EnumVariant:
+        return "enum-variant";
+    }
+    return "unknown";
+}
+
+static void DumpDropGlueSteps(std::ostream &out, const std::vector<DropGlueStep> &steps, const std::string &indent) {
+    for (const DropGlueStep &step : steps) {
+        out << std::format("{}{} {}", indent, DropGlueKindName(step.kind), step.type.ToString());
+        if (!step.name.empty()) {
+            out << std::format(" '{}'", step.name);
+        }
+        if (step.kind == DropGlueStep::Kind::Field || step.kind == DropGlueStep::Kind::TupleElement ||
+            step.kind == DropGlueStep::Kind::EnumVariant) {
+            out << std::format(" #{}", step.ordinal);
+        }
+        if (step.kind == DropGlueStep::Kind::ArrayElements) {
+            out << std::format(" count {}", step.count);
+            out << (step.reverse ? " order reverse" : " order forward");
+        }
+        out << '\n';
+        DumpDropGlueSteps(out, step.children, indent + "  ");
+    }
 }
 
 bool HirPrinter::Dump(const HirPackage &package, const std::filesystem::path &path) {
@@ -323,6 +434,13 @@ bool HirPrinter::Dump(const HirPackage &package, const std::filesystem::path &pa
         return false;
     }
     out << "=== High-level Intermediate Representation ===\n";
+    if (!package.dropGlues.empty()) {
+        out << "\nDrop glue\n---------\n";
+        for (const DropGluePlan &plan : package.dropGlues) {
+            out << std::format("{} for {}\n", plan.symbol, plan.type.ToString());
+            DumpDropGlueSteps(out, plan.steps, "  ");
+        }
+    }
     for (const auto &mod : package.modules) {
         out << '\n';
         out << std::format("Module \"{}\"\n", mod.name);

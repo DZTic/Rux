@@ -1,0 +1,265 @@
+import Algorithms::{ SortBy, SortDescendingBy, NthElementBy, PartialSortBy };
+import Algorithms::{ IsSorted, IsSortedBy };
+import Core::Ordering;
+import Algorithms::{ CopyTo, Reverse, SequenceEqual };
+import Core::MutableSlice;
+
+// Declares no operators at all. Every ordering below has to come from the
+// comparator, which is the point: a comparator is enough on its own.
+struct Task {
+    priority: int32;
+    id: int32;
+}
+
+
+// The extremes under a comparator moved to the MinMax test when they moved to slices and `Ordering`; what stays here
+// is the ordering-driven searching and sorting. `Equal` became `SequenceEqual` over slices in the same move.
+
+// `IsSorted` and `IsSortedBy` take a slice since the ordered searches moved to slices, and `IsSortedBy` takes a
+// three-way comparison. Sorting still takes a less-than, so both spellings of the same order live here.
+
+// `Copy` became `CopyTo` over slices, and `Reverse` takes a `MutableSlice`. These keep the calls below reading as
+// they did while the rest of the module is still pointer-and-length.
+
+// The sorts take a view since they moved to slices; a struct literal cannot appear inside an `if`
+// condition, so the views are built here.
+func Viewed<T>(data: *var T, length: uint) -> MutableSlice<T> {
+    return MutableSlice<T> { data: data, length: length };
+}
+
+func CopyInts(destination: *var int32, source: *int32, length: uint) -> bool {
+    return CopyTo<int32>(MutableSlice<int32> { data: destination, length: length },
+                         Slice<int32> { data: source, length: length });
+}
+
+func ReverseInts(data: *var int32, length: uint) {
+    Reverse<int32>(MutableSlice<int32> { data: data, length: length });
+}
+
+func Sorted<T>(data: *T, length: uint) -> bool {
+    return IsSorted<T>(Slice<T> { data: data, length: length });
+}
+
+func SortedTasks(data: *Task, length: uint, compare: func(Task, Task) -> Ordering) -> bool {
+    return IsSortedBy<Task>(Slice<Task> { data: data, length: length }, compare);
+}
+
+func ByPriorityOrder(left: Task, right: Task) -> Ordering {
+    if left.priority < right.priority {
+        return Ordering::Less;
+    }
+    if right.priority < left.priority {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
+func ByIdOrder(left: Task, right: Task) -> Ordering {
+    if left.id < right.id {
+        return Ordering::Less;
+    }
+    if right.id < left.id {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
+func SameInts(left: *int32, right: *int32, length: uint) -> bool {
+    return SequenceEqual<int32>(Slice<int32> { data: left, length: length },
+                                Slice<int32> { data: right, length: length });
+}
+
+func LessInt32Order(a: int32, b: int32) -> Ordering {
+    if a < b {
+        return Ordering::Less;
+    }
+    if b < a {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
+func GreaterInt32Order(a: int32, b: int32) -> Ordering {
+    if b < a {
+        return Ordering::Less;
+    }
+    if a < b {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
+func LessInt32(a: int32, b: int32) -> bool {
+    return a < b;
+}
+
+func GreaterInt32(a: int32, b: int32) -> bool {
+    return b < a;
+}
+
+func ByPriority(a: Task, b: Task) -> bool {
+    return a.priority < b.priority;
+}
+
+func ById(a: Task, b: Task) -> bool {
+    return a.id < b.id;
+}
+
+// A deliberately naive reference, structurally unlike introsort.
+func ReferenceSort(data: *var int32, length: uint, less: func(int32, int32) -> bool) {
+    var i: uint = 0;
+    while i < length {
+        var best = i;
+        var j = i + 1;
+        while j < length {
+            if less(data[j], data[best]) {
+                best = j;
+            }
+            j++;
+        }
+        let temp = data[i];
+        data[i] = data[best];
+        data[best] = temp;
+        i++;
+    }
+}
+
+func NextRandom(state: *var uint64) -> uint64 {
+    var x = *state;
+    x = x ^ (x >> 12u64);
+    x = x ^ (x << 25u64);
+    x = x ^ (x >> 27u64);
+    *state = x;
+    return x * 2685821657736338717u64;
+}
+
+// Sorts one copy with the comparator overload and another with the reference,
+// and requires them identical: ordering and multiset preservation at once.
+func CheckSort(source: *int32, length: uint) -> int {
+    var actual: int32[260];
+    var expected: int32[260];
+
+    CopyInts(@actual[0], source, length);
+    CopyInts(@expected[0], source, length);
+
+    SortBy<int32>(Viewed<int32>(@actual[0], length), LessInt32Order);
+    ReferenceSort(@expected[0], length, LessInt32);
+
+    if !Sorted<int32>(@actual[0], length) {
+        return 1;
+    }
+    if !SameInts(@actual[0], @expected[0], length) {
+        return 2;
+    }
+
+    // The reversed comparator gives exactly the reverse ordering.
+    var descending: int32[260];
+    CopyInts(@descending[0], source, length);
+    SortBy<int32>(Viewed<int32>(@descending[0], length), GreaterInt32Order);
+    ReverseInts(@descending[0], length);
+    if !SameInts(@descending[0], @expected[0], length) {
+        return 3;
+    }
+    return 0;
+}
+
+func Main() -> int {
+    var state: uint64 = 88172645463325252u64;
+    var buffer: int32[260];
+    var index: uint = 0;
+    var other: uint = 0;
+
+    // Shapes and sizes across the insertion-sort threshold, sorted by an
+    // explicit comparator rather than by `<`.
+    let sizes: uint[7] = [0, 1, 2, 3, 16, 17, 200];
+    var caseId: int = 0;
+    for n in sizes {
+        var i: uint = 0;
+        while i < n {
+            buffer[i] = (NextRandom(@state) % 60u64) as int32;
+            i++;
+        }
+        let kind = CheckSort(@buffer[0], n);
+        if kind != 0 {
+            return 10 + caseId * 4 + kind;
+        }
+        caseId++;
+    }
+
+    // Already sorted, reversed and all-equal, through the comparator path.
+    var ordered: int32[32];
+    var i: uint = 0;
+    while i < 32 {
+        ordered[i] = i as int32;
+        i++;
+    }
+    if CheckSort(@ordered[0], 32) != 0 { return 50; }
+    ReverseInts(@ordered[0], 32);
+    if CheckSort(@ordered[0], 32) != 0 { return 51; }
+    i = 0;
+    while i < 32 {
+        ordered[i] = 7;
+        i++;
+    }
+    if CheckSort(@ordered[0], 32) != 0 { return 52; }
+
+    // A type with no operators at all, ordered two different ways.
+    let five: uint = 5;
+    let six: uint = 6;
+    var tasks: Task[5] = [Task { priority: 3, id: 40 },
+                          Task { priority: 1, id: 50 },
+                          Task { priority: 3, id: 10 },
+                          Task { priority: 2, id: 30 },
+                          Task { priority: 1, id: 20 }];
+
+    SortBy<Task>(Viewed<Task>(@tasks[0], five), ByPriorityOrder);
+    if !SortedTasks(@tasks[0], five, ByPriorityOrder) { return 60; }
+    if tasks[0].priority != 1 || tasks[4].priority != 3 { return 61; }
+
+    SortBy<Task>(Viewed<Task>(@tasks[0], five), ByIdOrder);
+    if !SortedTasks(@tasks[0], five, ByIdOrder) { return 62; }
+    if tasks[0].id != 10 || tasks[4].id != 50 { return 63; }
+    // Ordering by id leaves priorities unsorted, so the two orders are really
+    // different rather than coincidentally equal.
+    if SortedTasks(@tasks[0], five, ByPriorityOrder) { return 64; }
+
+    SortDescendingBy<Task>(Viewed<Task>(@tasks[0], five), ByIdOrder);
+    if tasks[0].id != 50 || tasks[4].id != 10 { return 65; }
+
+    // Selection under a comparator, checked against a fully sorted copy.
+    var selection: int32[40];
+    i = 0;
+    while i < 40 {
+        selection[i] = (NextRandom(@state) % 30u64) as int32;
+        i++;
+    }
+    var sorted: int32[40];
+    CopyInts(@sorted[0], @selection[0], 40);
+    ReferenceSort(@sorted[0], 40, LessInt32);
+
+    var nth: int32[40];
+    CopyInts(@nth[0], @selection[0], 40);
+    if !NthElementBy<int32>(Viewed<int32>(@nth[0], 40), 17, LessInt32Order) { return 130; }
+    if nth[17] != sorted[17] { return 131; }
+    i = 0;
+    while i < 17 {
+        if LessInt32(nth[17], nth[i]) { return 132; }
+        i++;
+    }
+    i = 18;
+    while i < 40 {
+        if LessInt32(nth[i], nth[17]) { return 133; }
+        i++;
+    }
+    if NthElementBy<int32>(Viewed<int32>(@nth[0], 40), 40, LessInt32Order) { return 134; }
+
+    var partial: int32[40];
+    CopyInts(@partial[0], @selection[0], 40);
+    if !PartialSortBy<int32>(Viewed<int32>(@partial[0], 40), 8, LessInt32Order) { return 140; }
+    if !Sorted<int32>(@partial[0], 8) { return 141; }
+    if !SameInts(@partial[0], @sorted[0], 8) { return 142; }
+    if PartialSortBy<int32>(Viewed<int32>(@partial[0], 40), 41, LessInt32Order) { return 143; }
+    if !PartialSortBy<int32>(Viewed<int32>(@partial[0], 40), 0, LessInt32Order) { return 144; }
+
+    return 0;
+}

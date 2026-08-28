@@ -1,27 +1,36 @@
+#include "CodeGen/AArch64/RcuEmitter.h"
 #include "CodeGen/FloatLiteral.h"
 #include "CodeGen/PhiMoveResolver.h"
 #include "CodeGen/X86_64/AssemblyPrinter.h"
+#include "CodeGen/X86_64/FramePlan.h"
 #include "CodeGen/X86_64/RcuEmitter.h"
+#include "Driver/BuildTarget.h"
 #include "Ir/Hir/Hir.h"
+#include "Ir/Lir/LirPrinter.h"
 #include "Lexer/Lexer.h"
 #include "Lowering/AstToHir/AstToHir.h"
 #include "Lowering/HirToLir/HirToLir.h"
+#include "Optimization/Pipeline.h"
 #include "Semantic/SemanticAnalyzer.h"
 #include "Syntax/Parser/Parser.h"
 #include "Target/Platform.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <doctest.h>
+#include <format>
+#include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace Rux;
 
 static constexpr std::string_view SliceDecl = "struct Slice<T> { data: *T; length: uint; }\n";
 
-static LirPackage CompileToLir(const std::string &source) {
+static LirPackage CompileToLirFor(const std::string &source, const std::string &platform, const TargetContext &target) {
     Lexer lexer(std::string(SliceDecl) + source, "test.rux");
     auto lexed = lexer.Tokenize();
     REQUIRE_FALSE(lexed.HasErrors());
@@ -31,19 +40,30 @@ static LirPackage CompileToLir(const std::string &source) {
     REQUIRE_FALSE(parsed.HasErrors());
 
     std::vector<Module *> modules = {&parsed.module};
-    SemanticAnalyzer analyzer(modules, {}, "test", RUX_OS_WINDOWS ? "windows" : "linux");
+    SemanticAnalyzer analyzer(modules, {}, "test", platform);
     auto semaModel = analyzer.Analyze();
     REQUIRE_FALSE(semaModel.HasErrors());
 
     AstToHirLowering hirLowering(semaModel);
     auto hirPackage = hirLowering.Generate();
+    auto pipeline = Optimization::OptimizationPipeline::ForProfile(BuildProfile::Release);
+    REQUIRE(pipeline.RunHir(hirPackage).reachedFixedPoint);
 
-    HirToLirLowering lirLowering(std::move(hirPackage));
+    HirToLirLowering lirLowering(std::move(hirPackage), target);
     return lirLowering.Generate();
 }
 
+static LirPackage CompileToLir(const std::string &source) {
+    return CompileToLirFor(source, RUX_OS_WINDOWS ? "windows" : "linux", TargetContext::CreateNative());
+}
+
+// The printer defaults its target OS to the host, which is only correct when the
+// two agree. Pass the same target the LIR was lowered for, so the rendered ABI
+// describes the triple below rather than whatever machine the suite runs on.
 static std::string CompileToAsm(const std::string &source) {
-    AssemblyPrinter printer(CompileToLir(source));
+    const std::string_view triple = RUX_OS_WINDOWS ? "windows-x86_64" : "linux-x86_64";
+    const auto target = Driver::TargetContextForTriple(*Target::TargetTriple::Parse(triple));
+    AssemblyPrinter printer(CompileToLirFor(source, RUX_OS_WINDOWS ? "windows" : "linux", target), target.os);
     return printer.Generate();
 }
 
@@ -51,6 +71,117 @@ TEST_CASE("floating literal parsing preserves subnormal values") {
     CHECK_EQ(std::bit_cast<std::uint64_t>(ParseFloatLiteral<double>("5.0e-324")), 1);
     CHECK_EQ(std::bit_cast<std::uint32_t>(ParseFloatLiteral<float>("1.4e-45f32")), 1);
     CHECK_EQ(ParseFloatLiteral<double>("1_000.5"), 1000.5);
+}
+
+TEST_CASE("RCU backends preserve injected build metadata") {
+    LirModule module;
+    module.name = "Metadata.rux";
+    LirPackage package;
+    package.modules.push_back(std::move(module));
+    const BuildInfo buildInfo("12.34.56-rc.1+test", 1'234'567'890);
+
+    const auto x86Objects = RcuEmitter(package, "test", Target::OS::Linux, buildInfo).Generate();
+    const auto aarch64Objects = AArch64RcuEmitter(package, "test", Target::OS::Linux, buildInfo).Generate();
+
+    REQUIRE(x86Objects.size() == 1);
+    REQUIRE(aarch64Objects.size() == 1);
+    for (const RcuFile *object : {&x86Objects.front(), &aarch64Objects.front()}) {
+        CHECK(object->ruxVersion == 0x0C'22'38);
+        CHECK(object->buildTimestamp == 1'234'567'890);
+    }
+}
+
+TEST_CASE("x86-64 RCU module emission preserves shared builder invariants") {
+    const auto package = CompileToLir(R"(
+        func Sink(text: Slice<char8>, value: float32) {}
+
+        func Product(left: int, right: int) -> int {
+            Sink("shared", 1.25f32);
+            Sink("shared", 1.25f32);
+            return left * right;
+        }
+
+        func Main() -> int {
+            return Product(2, 3);
+        }
+    )");
+    RcuEmitter emitter(package, "test", Target::OS::Linux);
+    const auto objects = emitter.Generate();
+    REQUIRE(emitter.Diagnostics().empty());
+    REQUIRE(objects.size() == 1);
+    const auto &object = objects.front();
+    REQUIRE(object.sections.size() == 3);
+    CHECK(object.sections[RCU_TEXT_IDX].name == ".text");
+    CHECK(object.sections[RCU_RODATA_IDX].name == ".rodata");
+    CHECK(object.sections[RCU_DATA_IDX].name == ".data");
+
+    const auto countSymbols = [&](const std::string_view prefix) {
+        return std::ranges::count_if(object.symbols,
+                                     [prefix](const RcuSymbol &symbol) { return symbol.name.starts_with(prefix); });
+    };
+    CHECK(countSymbols("__str") == 1);
+    CHECK(countSymbols("__f32_") == 1);
+    const auto sink = std::ranges::find(object.symbols, "Sink", &RcuSymbol::name);
+    REQUIRE(sink != object.symbols.end());
+    CHECK(sink->sectionIdx == RCU_TEXT_IDX);
+
+    std::unordered_set<std::string> names;
+    for (const auto &symbol : object.symbols) {
+        CHECK(names.insert(symbol.name).second);
+    }
+}
+
+TEST_CASE("AArch64 RCU module emission matches shared x86-64 data invariants") {
+    const auto package = CompileToLir(R"(
+        func Sink(text: Slice<char8>, value: float32) {}
+
+        func Product(left: int, right: int) -> int {
+            Sink("shared", 1.3f32);
+            Sink("shared", 1.3f32);
+            return left * right;
+        }
+
+        func Main() -> int {
+            return Product(2, 3);
+        }
+    )");
+    RcuEmitter x86Emitter(package, "test", Target::OS::Linux);
+    AArch64RcuEmitter aarch64Emitter(package, "test", Target::OS::Linux);
+    const auto x86Objects = x86Emitter.Generate();
+    const auto aarch64Objects = aarch64Emitter.Generate();
+    REQUIRE(x86Emitter.Diagnostics().empty());
+    REQUIRE(aarch64Emitter.Diagnostics().empty());
+    REQUIRE(x86Objects.size() == 1);
+    REQUIRE(aarch64Objects.size() == 1);
+    const auto &x86 = x86Objects.front();
+    const auto &aarch64 = aarch64Objects.front();
+
+    REQUIRE(aarch64.sections.size() == 3);
+    for (const std::size_t section : {RCU_TEXT_IDX, RCU_RODATA_IDX, RCU_DATA_IDX}) {
+        CHECK(aarch64.sections[section].name == x86.sections[section].name);
+        CHECK(aarch64.sections[section].type == x86.sections[section].type);
+        CHECK(aarch64.sections[section].flags == x86.sections[section].flags);
+        CHECK(aarch64.sections[section].alignment == x86.sections[section].alignment);
+    }
+    CHECK(aarch64.sections[RCU_RODATA_IDX].data == x86.sections[RCU_RODATA_IDX].data);
+    CHECK(aarch64.sections[RCU_DATA_IDX].data == x86.sections[RCU_DATA_IDX].data);
+
+    const auto countSymbols = [&](const std::string_view prefix) {
+        return std::ranges::count_if(aarch64.symbols,
+                                     [prefix](const RcuSymbol &symbol) { return symbol.name.starts_with(prefix); });
+    };
+    CHECK(countSymbols("__str") == 1);
+    CHECK(countSymbols("__f32_") == 1);
+    std::unordered_set<std::string> names;
+    for (const auto &symbol : aarch64.symbols) {
+        CHECK(names.insert(symbol.name).second);
+    }
+    CHECK(std::ranges::any_of(aarch64.sections[RCU_TEXT_IDX].relocs,
+                              [](const RcuReloc &relocation) { return relocation.type == RcuRelType::AArch64Call26; }));
+    CHECK(std::ranges::all_of(aarch64.sections[RCU_TEXT_IDX].relocs, [&](const RcuReloc &relocation) {
+        return relocation.symbolIndex < aarch64.symbols.size() &&
+               relocation.sectionOffset < aarch64.sections[RCU_TEXT_IDX].data.size();
+    }));
 }
 
 TEST_CASE("RCU System V calls preserve register-allocated arguments") {
@@ -115,6 +246,11 @@ TEST_CASE("RCU default calling convention follows the requested target") {
     };
     CHECK(std::ranges::search(linuxText, linuxArgument).begin() != linuxText.end());
     CHECK(std::ranges::search(windowsText, windowsArgument).begin() != windowsText.end());
+
+    const std::string linuxAssembly = AssemblyPrinter(package, Target::OS::Linux).Generate();
+    const std::string windowsAssembly = AssemblyPrinter(package, Target::OS::Windows).Generate();
+    CHECK(linuxAssembly.find("mov     rdi, rax\n    call    Consume") != std::string::npos);
+    CHECK(windowsAssembly.find("mov     rcx, rax\n    sub     rsp, 32\n    call    Consume") != std::string::npos);
 }
 
 TEST_CASE("RCU System V calls pass two-word aggregates in two registers") {
@@ -248,20 +384,71 @@ TEST_CASE("assembly phi lowering breaks a swap cycle with a stack temporary") {
     function.name = "PhiSwap";
     function.returnType = intType;
     function.blocks = {std::move(entry), std::move(loop)};
+    const X86_64FramePlan plan = PlanX86_64Frame(function, {}, {}, Target::OS::Linux);
     LirModule module;
     module.name = "test";
     module.funcs.push_back(std::move(function));
     LirPackage package;
     package.modules.push_back(std::move(module));
 
-    const std::string output = AssemblyPrinter(std::move(package)).Generate();
-    const std::string expected = "mov     rax, qword [rbp - 24]\n"
-                                 "    mov     qword [rbp - 40], rax\n"
-                                 "    mov     rax, qword [rbp - 32]\n"
-                                 "    mov     qword [rbp - 24], rax\n"
-                                 "    mov     rax, qword [rbp - 40]\n"
-                                 "    mov     qword [rbp - 32], rax";
+    const std::string output = AssemblyPrinter(std::move(package), Target::OS::Linux).Generate();
+    const auto &slots = plan.SlotOffsets();
+    const std::string expected = std::format("mov     rax, qword [rbp - {}]\n"
+                                             "    mov     qword [rbp - {}], rax\n"
+                                             "    mov     rax, qword [rbp - {}]\n"
+                                             "    mov     qword [rbp - {}], rax\n"
+                                             "    mov     rax, qword [rbp - {}]\n"
+                                             "    mov     qword [rbp - {}], rax",
+                                             slots.at(3), plan.PhiTemporaryOffset(), slots.at(4), slots.at(3),
+                                             plan.PhiTemporaryOffset(), slots.at(4));
+    CHECK(output.find(std::format("sub     rsp, {}", plan.FrameSize())) != std::string::npos);
     CHECK(output.find(expected) != std::string::npos);
+}
+
+TEST_CASE("assembly printer uses shared x86-64 frame slots and register homes") {
+    LirFunc function;
+    function.name = "FrameParity";
+    function.callConv = CallingConvention::SysV;
+    function.returnType = TypeRef::MakeInt64();
+    function.params = {{0, TypeRef::MakeInt64(), "left"}, {1, TypeRef::MakeInt64(), "right"}};
+
+    LirInstr add;
+    add.op = LirOpcode::Add;
+    add.dst = 2;
+    add.type = TypeRef::MakeInt64();
+    add.srcs = {0, 1};
+    LirInstr alloca;
+    alloca.op = LirOpcode::Alloca;
+    alloca.dst = 3;
+    alloca.type = TypeRef::MakeInt64();
+    alloca.strArg = "3";
+
+    LirBlock block;
+    block.instrs = {add, alloca};
+    block.term.emplace();
+    block.term->kind = LirTermKind::Return;
+    block.term->retVal = 2;
+    block.term->retType = TypeRef::MakeInt64();
+    function.blocks.push_back(std::move(block));
+
+    const X86_64FramePlan plan = PlanX86_64Frame(function, {}, {}, Target::OS::Linux);
+    LirModule module;
+    module.name = "test";
+    module.funcs.push_back(std::move(function));
+    LirPackage package;
+    package.modules.push_back(std::move(module));
+
+    const std::string output = AssemblyPrinter(std::move(package), Target::OS::Linux).Generate();
+    const std::array<std::string_view, 5> registerNames = {"rbx", "r12", "r13", "r14", "r15"};
+    for (const int physicalRegister : plan.UsedPhysicalRegisters()) {
+        CHECK(output.find(std::format("push    {}", registerNames.at(physicalRegister))) != std::string::npos);
+    }
+    const std::int32_t localFrame =
+        plan.FrameSize() - static_cast<std::int32_t>(plan.UsedPhysicalRegisters().size() * 8);
+    CHECK(output.find(std::format("sub     rsp, {}", localFrame)) != std::string::npos);
+    CHECK(output.find(std::format("qword [rbp - {}], rdi", plan.SlotOffsets().at(0))) != std::string::npos);
+    CHECK(output.find(std::format("qword [rbp - {}], rsi", plan.SlotOffsets().at(1))) != std::string::npos);
+    CHECK(output.find(std::format("lea     rax, [rbp - {}]", plan.AllocaDataOffsets().at(3))) != std::string::npos);
 }
 
 TEST_CASE("string literal slices reference static storage") {
@@ -381,6 +568,216 @@ TEST_CASE("metadata blocks are rejected after compatibility attributes") {
     REQUIRE_EQ(parsed.diagnostics.size(), 1);
     CHECK_EQ(parsed.diagnostics.front().message,
              "metadata blocks '#{...}' are unsupported; use attribute calls such as '#Abi(.Win64)'");
+}
+
+TEST_CASE("extern C calls follow the target's ABI rather than the host's") {
+    const std::string source = R"(
+        #Link("hostlib")
+        extern func Emit(text: *uint8) -> int32;
+
+        func Main() -> int {
+            Emit(null);
+            return 0;
+        }
+    )";
+
+    const auto conventionOfEmitCall = [](const LirPackage &package) {
+        for (const auto &mod : package.modules) {
+            for (const auto &func : mod.funcs) {
+                for (const auto &block : func.blocks) {
+                    for (const auto &instr : block.instrs) {
+                        if (instr.op == LirOpcode::Call && instr.strArg == "Emit") {
+                            return instr.callConv;
+                        }
+                    }
+                }
+            }
+        }
+        return CallingConvention::Default;
+    };
+
+    // An extern declaration without an explicit #Abi resolves to the C ABI of
+    // the target being built for. Both cases have to hold on every host, which
+    // is the whole point: before the convention became target-driven, each of
+    // these recorded whatever the compiler was running on.
+    const auto windows = CompileToLirFor(
+        source, "windows", Driver::TargetContextForTriple(*Target::TargetTriple::Parse("windows-x86_64")));
+    CHECK_EQ(conventionOfEmitCall(windows), CallingConvention::Win64);
+
+    const auto linuxTarget =
+        CompileToLirFor(source, "linux", Driver::TargetContextForTriple(*Target::TargetTriple::Parse("linux-x86_64")));
+    CHECK_EQ(conventionOfEmitCall(linuxTarget), CallingConvention::SysV);
+
+    const auto windowsAArch64 = CompileToLirFor(
+        source, "windows", Driver::TargetContextForTriple(*Target::TargetTriple::Parse("windows-aarch64")));
+    CHECK_EQ(conventionOfEmitCall(windowsAArch64), CallingConvention::AAPCS64);
+}
+
+TEST_CASE("platform conventions are decided by the target OS and architecture") {
+    CHECK_EQ(PlatformCConvention(Target::OS::Windows, Target::Arch::X86_64), CallingConvention::Win64);
+    CHECK_EQ(PlatformCConvention(Target::OS::Linux, Target::Arch::X86_64), CallingConvention::SysV);
+    CHECK_EQ(PlatformCConvention(Target::OS::MacOS, Target::Arch::X86_64), CallingConvention::SysV);
+    CHECK_EQ(PlatformCConvention(Target::OS::Windows, Target::Arch::AArch64), CallingConvention::AAPCS64);
+    CHECK_EQ(PlatformCConvention(Target::OS::Linux, Target::Arch::AArch64), CallingConvention::AAPCS64);
+
+    CHECK_EQ(PlatformDefaultConvention(Target::OS::Linux, Target::Arch::X86_64), CallingConvention::SysV);
+    CHECK_EQ(PlatformDefaultConvention(Target::OS::Windows, Target::Arch::X86_64), CallingConvention::Win64);
+    CHECK_EQ(PlatformDefaultConvention(Target::OS::Windows, Target::Arch::AArch64), CallingConvention::AAPCS64);
+
+    // Win64 belongs to Windows alone. macOS and FreeBSD are System V on x86-64,
+    // for the internal ABI exactly as for the C ABI.
+    CHECK_EQ(PlatformDefaultConvention(Target::OS::MacOS, Target::Arch::X86_64), CallingConvention::SysV);
+    CHECK_EQ(PlatformDefaultConvention(Target::OS::FreeBSD, Target::Arch::X86_64), CallingConvention::SysV);
+    CHECK_EQ(PlatformCConvention(Target::OS::FreeBSD, Target::Arch::X86_64), CallingConvention::SysV);
+
+    // `.C` collapses against the target; concrete conventions pass through.
+    CHECK_EQ(ResolveCConvention(CallingConvention::C, Target::OS::Windows, Target::Arch::X86_64),
+             CallingConvention::Win64);
+    CHECK_EQ(ResolveCConvention(CallingConvention::C, Target::OS::Linux, Target::Arch::X86_64),
+             CallingConvention::SysV);
+    CHECK_EQ(ResolveCConvention(CallingConvention::C, Target::OS::Windows, Target::Arch::AArch64),
+             CallingConvention::AAPCS64);
+    CHECK_EQ(ResolveCConvention(CallingConvention::SysV, Target::OS::Windows, Target::Arch::AArch64),
+             CallingConvention::SysV);
+    CHECK_EQ(ResolveCConvention(CallingConvention::Default, Target::OS::Linux, Target::Arch::AArch64),
+             CallingConvention::Default);
+
+    // The argument-less forms stay host-defaulted.
+    CHECK_EQ(PlatformCConvention(), PlatformCConvention(Target::HostOS, Target::HostArch));
+    CHECK_EQ(PlatformDefaultConvention(), PlatformDefaultConvention(Target::HostOS, Target::HostArch));
+}
+
+TEST_CASE("C variadic call metadata survives package-wide extern lookup and Link renaming") {
+    HirPackage hir;
+
+    HirModule interop;
+    interop.name = "Interop";
+    HirExternFunc external;
+    external.name = "Format";
+    external.dll = "runtime";
+    external.symbolName = "native_format";
+    external.callConv = CallingConvention::C;
+    external.isVariadic = true;
+    external.params.push_back({"format", TypeRef::MakePointer(TypeRef::MakeChar8()), false});
+    external.returnType = TypeRef::MakeInt32();
+    interop.externFuncs.push_back(std::move(external));
+    hir.modules.push_back(std::move(interop));
+
+    HirModule application;
+    application.name = "Application";
+    HirFunc main;
+    main.name = "Main";
+    main.returnType = TypeRef::MakeOpaque();
+    HirBlock body;
+    auto statement = std::make_unique<HirExprStmt>();
+    auto call = std::make_unique<HirCallExpr>();
+    auto callee = std::make_unique<HirPathExpr>();
+    callee->segments = {"Interop", "Format"};
+    call->callee = std::move(callee);
+    call->type = TypeRef::MakeInt32();
+    auto format = std::make_unique<HirLiteralExpr>();
+    format->value = "null";
+    format->type = TypeRef::MakePointer(TypeRef::MakeChar8());
+    call->args.push_back(std::move(format));
+    auto argument = std::make_unique<HirLiteralExpr>();
+    argument->value = "42";
+    argument->type = TypeRef::MakeInt32();
+    call->args.push_back(std::move(argument));
+    statement->expr = std::move(call);
+    body.stmts.push_back(std::move(statement));
+    main.body = std::move(body);
+    application.funcs.push_back(std::move(main));
+    hir.modules.push_back(std::move(application));
+
+    const auto package =
+        HirToLirLowering(std::move(hir),
+                         Driver::TargetContextForTriple(*Target::TargetTriple::Parse("windows-aarch64")))
+            .Generate();
+    REQUIRE_EQ(package.modules.size(), 2);
+    REQUIRE_EQ(package.modules[0].funcs.size(), 1);
+    CHECK_EQ(package.modules[0].funcs[0].name, "native_format");
+    CHECK_EQ(package.modules[0].funcs[0].callConv, CallingConvention::AAPCS64);
+    CHECK(package.modules[0].funcs[0].isVariadic);
+
+    const auto &instructions = package.modules[1].funcs[0].blocks[0].instrs;
+    const auto found = std::ranges::find_if(
+        instructions, [](const LirInstr &instruction) { return instruction.op == LirOpcode::Call; });
+    REQUIRE(found != instructions.end());
+    CHECK_EQ(found->strArg, "native_format");
+    CHECK_EQ(found->callConv, CallingConvention::AAPCS64);
+    CHECK(found->isCVariadic);
+    CHECK_EQ(found->cVariadicFixedParamCount, std::optional<std::uint32_t>(1));
+}
+
+TEST_CASE("Rux variadics remain slice calls rather than C variadic calls") {
+    const auto package =
+        CompileToLirFor(R"(
+        func Sum(values: int...) -> int {
+            return 0;
+        }
+
+        func Main() -> int {
+            return Sum(1, 2);
+        }
+    )",
+                        "windows", Driver::TargetContextForTriple(*Target::TargetTriple::Parse("windows-aarch64")));
+
+    for (const auto &function : package.modules.front().funcs) {
+        for (const auto &block : function.blocks) {
+            for (const auto &instruction : block.instrs) {
+                if (instruction.op == LirOpcode::Call && instruction.strArg == "Sum") {
+                    CHECK_FALSE(instruction.isCVariadic);
+                    CHECK_FALSE(instruction.cVariadicFixedParamCount.has_value());
+                    CHECK_EQ(instruction.callConv, CallingConvention::Default);
+                    return;
+                }
+            }
+        }
+    }
+    FAIL("expected a direct call to Sum");
+}
+
+TEST_CASE("LIR dumps resolved convention and C variadic call metadata") {
+    LirPackage package;
+    LirModule module;
+    module.name = "Test";
+
+    LirFunc external;
+    external.name = "native_format";
+    external.isExtern = true;
+    external.isVariadic = true;
+    external.callConv = CallingConvention::AAPCS64;
+    external.returnType = TypeRef::MakeOpaque();
+    module.funcs.push_back(std::move(external));
+
+    LirFunc caller;
+    caller.name = "Main";
+    caller.returnType = TypeRef::MakeOpaque();
+    LirBlock entry;
+    entry.label = "entry";
+    LirInstr call;
+    call.op = LirOpcode::Call;
+    call.type = TypeRef::MakeOpaque();
+    call.strArg = "native_format";
+    call.callConv = CallingConvention::AAPCS64;
+    call.isCVariadic = true;
+    call.cVariadicFixedParamCount = 0;
+    entry.instrs.push_back(std::move(call));
+    caller.blocks.push_back(std::move(entry));
+    module.funcs.push_back(std::move(caller));
+    package.modules.push_back(std::move(module));
+
+    const auto path = std::filesystem::temp_directory_path() / "rux-call-metadata-lir.txt";
+    REQUIRE(LirPrinter::Dump(package, path));
+    std::ifstream input(path);
+    REQUIRE(input.good());
+    const std::string dump((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    input.close();
+    std::error_code error;
+    std::filesystem::remove(path, error);
+
+    CHECK(dump.find("extern func native_format(...) cc=aapcs64") != std::string::npos);
+    CHECK(dump.find("call opaque @native_format() cc=aapcs64 c_variadic fixed=0") != std::string::npos);
 }
 
 TEST_CASE("Abi attribute replaces ABI metadata blocks") {

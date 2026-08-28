@@ -1,60 +1,128 @@
-import Collections::Array;
+import Allocator::{ Allocator, SystemAllocator };
+import Collections::{ Array, CollectionError };
+import Core::Assert;
 
-struct Pair {
-    first: int32;
-    second: int32;
+// An array owns its storage and its elements, so the questions worth asking are about ownership: does destroying one
+// destroy what it holds, exactly once, and does a failed construction leave anything behind. Counting destructions is
+// the only way to see that, so the element type counts them.
+
+// The counter lives where the test put it. The element only points at it, so destroying an element is observable and
+// the count survives the element.
+struct Tracked {
+    counter: *var int32;
+    value: int32;
+}
+
+extend Tracked {
+    func =(self: &var Tracked, other: &Tracked) {
+        self.counter = other.counter;
+        self.value = other.value;
+    }
+
+    func ~Tracked(self: &var Tracked) {
+        if self.counter != null {
+            *self.counter = *self.counter + 1i32;
+        }
+    }
+}
+
+// A scope for an array, so its destruction happens somewhere observable.
+func FillAndDrop(allocator: Allocator, counter: *var int32, length: uint) -> CollectionError {
+    var error = CollectionError::None;
+    var array = Array::Filled<Tracked>(allocator, length, Tracked { counter: counter, value: 5 }, @error);
+    if error.IsError() {
+        return error;
+    }
+    Assert(array.Length() == length, "the array is the length it was asked for");
+    return CollectionError::None;
+}
+
+func SumOf(allocator: Allocator) -> int32 {
+    var values: int32[4];
+    values[0] = 1;
+    values[1] = 2;
+    values[2] = 3;
+    values[3] = 4;
+    var error = CollectionError::None;
+    var array = Array::FromSlice<int32>(allocator, Slice<int32> { data: @values[0], length: 4 }, @error);
+    Assert(error == CollectionError::None, "an array of numbers is made");
+
+    var total: int32 = 0;
+    for value in array {
+        total = total + value;
+    }
+    return total;
 }
 
 func Main() -> int {
-    // Empty arrays allocate nothing and remain safe to release.
-    var empty = Array::New<int32>(0);
-    if !empty.IsEmpty() { return 10; }
-    if empty.Length() != 0 { return 11; }
-    if empty.Data() != null { return 12; }
-    empty.Free();
+    var system = SystemAllocator();
+    let allocator: Allocator = system;
 
-    // New reserves exactly the requested fixed number of typed slots.
-    var values = Array::New<int32>(3);
-    if values.IsEmpty() { return 20; }
-    if values.Length() != 3 { return 21; }
-    if values.Data() == null { return 22; }
-    values.Set(0, 10);
-    values.Set(1, 20);
-    values.Set(2, 30);
-    if values.At(0) != 10 || values.At(1) != 20 || values.At(2) != 30 { return 23; }
+    // The ordinary shape: numbers copied in, walked, and released with the array.
+    Assert(SumOf(allocator) == 10, "an array holds what was copied into it and iterates over it");
 
-    // AsSlice borrows the same allocation rather than copying it.
-    let borrowed = values.AsSlice();
-    if borrowed.data != values.Data() || borrowed.length != values.Length() { return 30; }
-    values.Set(1, 25);
-    if borrowed[1] != 25 { return 31; }
+    // Filling with a value copies it into every position.
+    var error = CollectionError::None;
+    var filled = Array::Filled<int32>(allocator, 6, 7, @error);
+    Assert(error == CollectionError::None, "a filled array is made");
+    Assert(filled.Length() == 6, "with the length asked for");
+    Assert(!filled.IsEmpty(), "and is not empty");
+    var index: uint = 0;
+    var value: int32 = 0;
+    while index < 6 {
+        Assert(filled.Get(index).TryIntoValue(@value), "every index has an element");
+        Assert(value == 7, "and every element is the value it was filled with");
+        index++;
+    }
+    Assert(filled.Get(6).IsNone(), "one past the end has no element");
+    Assert(filled.Reference(6).IsNone(), "and no pointer either");
 
-    // Clone owns an independent allocation with the same element values.
-    var copy = values.Clone();
-    if copy.Data() == values.Data() { return 40; }
-    if copy.At(0) != 10 || copy.At(1) != 25 || copy.At(2) != 30 { return 41; }
-    copy.Set(0, 99);
-    if values.At(0) != 10 { return 42; }
-    copy.Free();
+    // Setting replaces an element and refuses an index the array does not have.
+    Assert(filled.Set(2, 99) == CollectionError::None, "setting an element in range succeeds");
+    Assert(filled.Get(2).TryIntoValue(@value) && value == 99, "and replaces what was there");
+    Assert(filled.Set(6, 1) == CollectionError::IndexOutOfRange, "setting past the end is refused");
+    Assert(filled.Get(5).TryIntoValue(@value) && value == 7, "changing nothing");
 
-    // From copies a slice and leaves its source untouched.
-    let source: Slice<int32> = [4, 5, 6, 7];
-    var from = Array::From<int32>(source);
-    if from.Length() != 4 || from.Data() == source.data { return 50; }
-    from.Set(0, 8);
-    if source[0] != 4 || from.At(0) != 8 { return 51; }
-    from.Free();
+    // A borrowed view is what the algorithms take, and it sees the array's own storage.
+    let view = filled.AsSlice();
+    Assert(view.length == 6, "the view is the whole array");
+    Assert(view.data == filled.AsSlice().data, "over the array's own storage");
 
-    // Element size participates in allocation and pointer indexing.
-    var pairs = Array::New<Pair>(2);
-    pairs.Set(0, Pair { first: 1, second: 2 });
-    pairs.Set(1, Pair { first: 3, second: 4 });
-    if pairs.At(0).second != 2 || pairs.At(1).first != 3 { return 60; }
-    pairs.Free();
+    // An empty array owns a block it still releases, and is not a special shape anywhere.
+    var empty = Array::Filled<int32>(allocator, 0, 0, @error);
+    Assert(error == CollectionError::None, "an empty array is made");
+    Assert(empty.IsEmpty(), "and is empty");
+    Assert(empty.Length() == 0, "with no elements");
+    Assert(empty.Get(0).IsNone(), "and nothing at any index");
 
-    // Free resets ownership, making repeated release a no-op.
-    values.Free();
-    if !values.IsEmpty() || values.Data() != null { return 70; }
-    values.Free();
+    // A length that cannot be sized is refused as arithmetic, and what comes back owns nothing.
+    var impossible = Array::Filled<int32>(allocator, uint::Max, 0, @error);
+    Assert(error == CollectionError::CapacityOverflow, "a length that cannot be sized is refused");
+    Assert(impossible.IsEmpty(), "and the array that comes back owns nothing");
+
+    // Destruction: every element of an array is destroyed exactly once when the array's life ends.
+    //
+    // `Filled` copies its value into every position, then destroys the source parameter when the call ends.
+    // rather than copied and destroyed, so the count is the length exactly. An element type that owns something
+    // could not be filled this way at all -- the copies would each claim what one of them owns -- which is why the
+    // element here owns nothing but a pointer to the counter.
+    var destroyed: int32 = 0;
+    Assert(FillAndDrop(allocator, @destroyed, 5) == CollectionError::None, "an array of tracked elements is made");
+    Assert(destroyed == 6, "and destroys every element plus the source parameter exactly once");
+
+    destroyed = 0;
+    Assert(FillAndDrop(allocator, @destroyed, 1) == CollectionError::None, "a single-element array is made");
+    Assert(destroyed == 2, "and destroys its element and source parameter once");
+
+    // One for a length of zero: the value was handed over and never copied anywhere, so `Filled` destroys its
+    // parameter rather than leaving it to nobody.
+    destroyed = 0;
+    Assert(FillAndDrop(allocator, @destroyed, 0) == CollectionError::None, "an empty array of them is made");
+    Assert(destroyed == 1, "and destroys the value it was given but never stored");
+
+    destroyed = 0;
+    Assert(FillAndDrop(allocator, @destroyed, 32) == CollectionError::None, "a longer array is made");
+    Assert(destroyed == 33, "with one destruction per element plus the source parameter");
+
     return 0;
 }

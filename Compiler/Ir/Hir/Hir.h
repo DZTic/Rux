@@ -1,8 +1,10 @@
 #pragma once
 
 #include "Lexer/Token.h"
+#include "Semantic/DropGlue.h"
 #include "Semantic/Type.h"
-#include "Source/SourceLocation.h"
+#include "Semantic/TypeProperties.h"
+#include "SourceModel/SourceLocation.h"
 #include "Target/AsmInstr.h"
 #include "Target/CallingConvention.h"
 
@@ -23,6 +25,36 @@ struct HirBlock;
 using HirExprPtr = std::unique_ptr<HirExpr>;
 using HirStmtPtr = std::unique_ptr<HirStmt>;
 using HirPatternPtr = std::unique_ptr<HirPattern>;
+
+/// One compiler-inserted destruction of a named binding. The action is conditional on the binding's drop flag: a
+/// successful initialization sets the flag and a consuming expression clears it after evaluating the source value.
+struct HirDropAction {
+    std::uint64_t bindingId = 0;
+    std::string name;
+    TypeRef type;
+    std::string glueSymbol;
+    /// Declaration site retained for cleanup diagnostics and later drop-glue lowering.
+    SourceLocation origin;
+};
+
+/// A completed subobject that must be destroyed if evaluation of a later aggregate component exits early.
+struct HirPartialDropAction {
+    enum class Kind {
+        Field,
+        Element,
+        TupleElement,
+        EnumPayload,
+    };
+
+    Kind kind = Kind::Element;
+    std::size_t ordinal = 0;
+    std::string name;
+    TypeRef type;
+    std::string glueSymbol;
+    SourceLocation origin;
+};
+
+using HirFailureCleanup = std::vector<HirPartialDropAction>;
 
 // HIR Block
 struct HirBlock {
@@ -49,6 +81,8 @@ struct HirLiteralPattern : HirPattern {
 struct HirBindingPattern : HirPattern {
     std::string name;
     TypeRef type;
+    /// Nonzero only when this pattern owns a value whose destruction is scheduled at the enclosing scope exit.
+    std::uint64_t bindingId = 0;
 };
 
 // lo..hi
@@ -97,6 +131,11 @@ struct HirGuardedPattern : HirPattern {
 struct HirExpr {
     TypeRef type;
     SourceLocation location;
+    std::optional<ValueConsumptionKind> consumption;
+    /// The storage identity invalidated after this expression has been evaluated. Zero denotes a consumed temporary
+    /// or aggregate value that is not backed by a named binding. Cleanup lowering uses this identity as a drop flag,
+    /// so a path that consumes a local cannot destroy the same value again at scope exit.
+    std::uint64_t consumedBindingId = 0;
     virtual ~HirExpr() = default;
 };
 
@@ -130,18 +169,74 @@ struct HirPostfixExpr : HirExpr {
     HirExprPtr operand;
 };
 
-// a + b, a && b, a == b, etc.
+/// a + b, a && b, a == b, etc.
 struct HirBinaryExpr : HirExpr {
     TokenKind op;
     HirExprPtr left;
     HirExprPtr right;
 };
 
-// a = b, a += b, etc.
+/// Recursive recipe for constructing an independent value from a named source place. Trivial leaves are copied as
+/// bits; custom leaves call the selected `=` operation; aggregate nodes visit their components in declaration order.
+struct HirCopyPlan {
+    enum class Kind {
+        Trivial,
+        Custom,
+        Structure,
+        Array,
+        Tuple,
+        Enum,
+    };
+
+    Kind kind = Kind::Trivial;
+    TypeRef type;
+    std::string customCallee;
+    std::vector<std::string> componentNames;
+    std::vector<HirCopyPlan> components;
+    std::vector<std::string> variantDiscriminants;
+    std::vector<std::vector<TypeRef>> variantPayloadTypes;
+    std::vector<std::vector<HirCopyPlan>> variantComponents;
+};
+
+struct HirCopyExpr : HirExpr {
+    HirExprPtr value;
+    HirCopyPlan plan;
+};
+
+/// Recursive recipe for relocating a named value into fresh destination storage. Generated aggregate nodes move each
+/// component; custom leaves invoke the selected `<-` operation with the source value exactly once.
+struct HirMovePlan {
+    enum class Kind {
+        Trivial,
+        Custom,
+        Structure,
+        Array,
+        Tuple,
+    };
+
+    Kind kind = Kind::Trivial;
+    TypeRef type;
+    std::string customCallee;
+    std::vector<std::string> componentNames;
+    std::vector<HirMovePlan> components;
+};
+
+struct HirMoveExpr : HirExpr {
+    HirExprPtr value;
+    HirMovePlan plan;
+};
+
+/// a = b, a <- b, a += b, etc.
 struct HirAssignExpr : HirExpr {
     TokenKind op;
     HirExprPtr target;
     HirExprPtr value;
+    /// For plain assignment, destroy the old target after evaluating `value` and before storing it. A nonzero binding
+    /// identity makes the action conditional; the completed store then marks that binding live, allowing assignment to
+    /// initialize previously uninitialized or moved storage.
+    std::optional<HirDropAction> overwriteCleanup;
+    /// Set for a write that must reach memory even though nothing reads it back, which is what zeroizing a secret is.
+    bool isVolatile = false;
 };
 
 // cond ? thenExpr : elseExpr
@@ -163,29 +258,30 @@ struct HirCallExpr : HirExpr {
     HirExprPtr callee;
     std::vector<HirExprPtr> args;
     bool isNoReturn = false;
-    // Populated for compiler builtins that need to report their call site.
+    /// Populated for compiler builtins that need to report their call site.
     std::string sourceFile;
     std::string sourceFunction;
     std::uint32_t sourceLine = 0;
     std::uint32_t sourceColumn = 0;
 };
 
-// Wrap a concrete value into an interface fat pointer {data_ptr,
-// vtable_ptr}
+/// Wrap a concrete value into an interface fat pointer {data_ptr, vtable_ptr}.
 struct HirCoerceToInterfaceExpr : HirExpr {
     HirExprPtr value;
     std::string vtableLabel;
+    /// A reference-to-interface view points at the source place directly. A by-value interface keeps the legacy
+    /// compatibility behavior of materializing its own concrete storage.
+    bool borrowed = false;
 };
 
-// A fixed inline array viewed as a non-owning Slice<T>.
+/// A fixed inline array viewed as a non-owning Slice<T>.
 struct HirArrayToSliceExpr : HirExpr {
     HirExprPtr value;
     TypeRef elementType;
     std::uint64_t length = 0;
 };
 
-// Call a method through an interface fat pointer (dynamic dispatch via
-// vtable)
+/// Call a method through an interface fat pointer (dynamic dispatch via vtable)
 struct HirInterfaceCallExpr : HirExpr {
     HirExprPtr fatPtrExpr; // expression that yields the fat-pointer address
     // (8 bytes)
@@ -214,17 +310,23 @@ struct HirStructInitField {
 struct HirStructInitExpr : HirExpr {
     std::string typeName;
     std::vector<HirStructInitField> fields;
+    /// Entry i destroys components completed before field i when evaluation of field i exits early.
+    std::vector<HirFailureCleanup> failureCleanups;
 };
 
 // [a, b, c]
 struct HirArrayExpr : HirExpr {
     TypeRef elementType;
     std::vector<HirExprPtr> elements;
+    /// Entry i destroys elements [0, i) in reverse order if element i does not finish initialization.
+    std::vector<HirFailureCleanup> failureCleanups;
 };
 
 // (a, b, c)
 struct HirTupleExpr : HirExpr {
     std::vector<HirExprPtr> elements;
+    /// Entry i destroys tuple elements [0, i) in reverse order if element i exits early.
+    std::vector<HirFailureCleanup> failureCleanups;
 };
 
 // expr as Type
@@ -243,12 +345,19 @@ struct HirIsExpr : HirExpr {
 struct HirBlockExpr : HirExpr {
     ~HirBlockExpr() override;
     HirBlock block;
+
+    /// The expression the block evaluates to, when it has one. A block lowered from source has none — Rux blocks are
+    /// statements — but a lowering that needs to bind an operand before using it twice builds one that does, so the
+    /// operand is evaluated once and named twice.
+    HirExprPtr value;
 };
 
 struct HirMatchArm {
     SourceLocation location;
     HirPatternPtr pattern;
     HirExprPtr body;
+    /// Pattern bindings are destroyed after the arm body has produced its value.
+    std::vector<HirDropAction> cleanups;
 };
 
 // match expr { pat => expr, ... }
@@ -260,6 +369,8 @@ struct HirMatchExpr : HirExpr {
 struct HirEnumConstructExpr : HirExpr {
     std::vector<HirExprPtr> payloads;
     std::string discriminant;
+    /// Entry i destroys payloads [0, i) in reverse order if payload i exits early.
+    std::vector<HirFailureCleanup> failureCleanups;
 };
 
 // HIR Statements
@@ -281,6 +392,13 @@ struct HirLetStmt : HirStmt {
     HirPatternPtr pattern;
     TypeRef type;
     HirExprPtr init;
+    /// Identity of the conditional drop flag established by this declaration, or zero for a Copy binding.
+    std::uint64_t bindingId = 0;
+};
+
+// Compiler-inserted cleanup on ordinary block fallthrough.
+struct HirDropStmt : HirStmt {
+    HirDropAction action;
 };
 
 // if cond { } else if cond { } else { }
@@ -324,10 +442,11 @@ struct HirForStmt : HirStmt {
     TypeRef varType;
     HirExprPtr iterable;
     HirBlock body;
-    // True when `variable` names a mutable variable already in scope, which the
-    // loop reuses as its induction variable rather than introducing a fresh
-    // binding. The loop then mutates that outer variable, so its final value
-    // persists after the loop (e.g. `for k in k..7` leaves k == 7).
+    /// Nonzero for an owned induction value; every iteration marks this flag live before entering the body.
+    std::uint64_t bindingId = 0;
+    /// True when `variable` names a mutable variable already in scope, which the loop reuses as its induction variable
+    /// rather than introducing a fresh binding. The loop then mutates that outer variable, so its final value persists
+    /// after the loop (e.g. `for k in k..7` leaves k == 7).
     bool reusesOuterVar = false;
 };
 
@@ -336,23 +455,32 @@ struct HirMatchStmt : HirStmt {
     std::vector<HirMatchArm> arms;
 };
 
+/// A nested scope, which source has no syntax for. A desugaring that needs a binding of its own -- the iterator a `for`
+/// over a user-written container advances -- puts it here so the binding lives exactly as long as the construct does.
+struct HirScopeStmt : HirStmt {
+    HirBlock block;
+};
+
 // return [expr];
 struct HirReturnStmt : HirStmt {
     std::optional<HirExprPtr> value;
+    /// Cleanups run after evaluating `value` and clearing its consumed binding, but before control leaves the function.
+    std::vector<HirDropAction> cleanups;
 };
 
 // break [label];
 struct HirBreakStmt : HirStmt {
     std::string label;
+    std::vector<HirDropAction> cleanups;
 };
 
 // continue [label];
 struct HirContinueStmt : HirStmt {
     std::string label;
+    std::vector<HirDropAction> cleanups;
 };
 
-// local declaration inside a block (func, const, type alias declared
-// locally)
+/// local declaration inside a block (func, const, type alias declared locally)
 struct HirLocalDecl : HirStmt {
     std::string description;
     bool hasConstant = false;
@@ -366,6 +494,8 @@ struct HirParam {
     std::string name;
     TypeRef type;
     bool isVariadic = false;
+    /// Identity of an initially live parameter drop flag; Copy and borrowed parameters retain zero.
+    std::uint64_t bindingId = 0;
 };
 
 // func [asm] Name<T>(params) -> RetType { body }
@@ -447,6 +577,9 @@ struct HirImplBlock {
     std::string typeName;
     std::optional<std::string> interfaceName;
     std::vector<HirFunc> methods;
+    std::vector<std::string> methodLinkerNames;
+    std::string vtableLabel;
+    std::vector<std::string> vtableEntries;
     SourceLocation location;
 };
 
@@ -463,8 +596,7 @@ struct HirConst {
 struct HirExternFunc {
     std::string name;
     std::string dll;
-    // The name imported from the DLL, when it differs from `name`. Empty means
-    // the two are the same.
+    /// The name imported from the DLL, when it differs from `name`. Empty means the two are the same.
     std::string symbolName;
     bool isPublic = false;
     bool isNoReturn = false;
@@ -508,6 +640,7 @@ struct HirModule {
 
 struct HirPackage {
     std::vector<HirModule> modules;
+    std::vector<DropGluePlan> dropGlues;
 };
 
 inline HirGuardedPattern::~HirGuardedPattern() = default;

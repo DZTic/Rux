@@ -3,7 +3,7 @@
     Copyright © 2026 Rux Contributors
     Licensed under the MIT License
 */
-import Rux::Assert;
+import Core::Assert;
 
 interface Figure {
     func Area() -> int;
@@ -14,7 +14,7 @@ struct Square {
 }
 
 extend Square : Figure {
-    func Area(self) -> int {
+    func Area(self: &Square) -> int {
         return self.size * self.size;
     }
 }

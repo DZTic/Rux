@@ -1,11 +1,15 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "String"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Language test: String"
 
 [Dependencies]
-Rux = { Path = "../../../Packages/Rux" }
+Allocator = { Path = "../../../Packages/Allocator" }
+Core = { Path = "../../../Packages/Core" }
 Text = { Path = "../../../Packages/Text" }
 
 [Build]

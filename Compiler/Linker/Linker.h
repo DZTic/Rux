@@ -1,30 +1,36 @@
 #pragma once
 
+#include "Linker/ArtifactKind.h"
+#include "Linker/RcuLinkGraph.h"
 #include "Object/Rcu/Rcu.h"
 #include "Target/Target.h"
 
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Rux {
 struct LinkerError {
     std::string message;
+    std::vector<std::string> notes;
 };
 
-// Links one or more RcuFile objects into a native x86-64 executable, choosing
-// the object format from the target OS: Windows → PE32+, macOS → Mach-O,
-// every other supported OS (Linux, the BSDs, illumos) → ELF64. All three
-// writers are always compiled; Link() dispatches on `targetOs` at run time.
+/// Links one or more RcuFile objects into a native executable, choosing the object format from the target OS: Windows →
+/// PE32+, macOS → Mach-O, every other supported OS (Linux, the BSDs, illumos) → ELF64. All three writers are always
+/// compiled; Link() dispatches on `targetOs` at run time.
+///
+/// The target architecture is given explicitly rather than taken from the host, and every input object must have been
+/// compiled for it. x86-64 is laid out in every format; AArch64 supports ELF, PE/COFF, and Mach-O images.
 class Linker {
 public:
     explicit Linker(std::vector<RcuFile> inputObjects, std::string inputPackageName,
-                    std::vector<std::filesystem::path> inputImportSearchDirs = {}, bool inputIsDll = false,
-                    Target::OS inputTargetOs = Target::HostOS);
+                    std::vector<std::filesystem::path> inputImportSearchDirs, ArtifactKind inputArtifactKind,
+                    Target::OS inputTargetOs, Target::Arch inputTargetArch);
 
-    // Produce the EXE or DLL at outputPath. Creates parent directories as
-    // needed. Returns false if any errors occurred; call Errors() for
-    // details.
+    /// Produce the EXE or DLL at outputPath. Creates parent directories as needed. Returns false if any errors
+    /// occurred; call Errors() for details.
     [[nodiscard]] bool Link(const std::filesystem::path &outputPath);
 
     [[nodiscard]] const std::vector<LinkerError> &Errors() const {
@@ -36,15 +42,24 @@ private:
     std::string packageName;
     std::vector<std::filesystem::path> importSearchDirs;
     std::vector<LinkerError> errors;
-    bool isDll = false;
+    ArtifactKind artifactKind = ArtifactKind::Executable;
     Target::OS targetOs = Target::HostOS;
+    Target::Arch targetArch = Target::HostArch;
+    std::optional<RcuLinkGraph> graph;
 
-    void Error(std::string msg);
+    void Error(std::string msg, std::vector<std::string> notes = {});
 
-    // Object-format writers, one per target family. Each is always compiled;
-    // Link() selects the one matching `targetOs`.
-    [[nodiscard]] bool LinkPe64(const std::filesystem::path &outputPath);
+    [[nodiscard]] std::vector<std::string> RelocationNotes(const RcuLinkReference &reference,
+                                                           std::string_view error) const;
+
+    [[nodiscard]] bool BuildGraph();
+    [[nodiscard]] std::vector<std::string> WindowsExportNames() const;
+
+    /// Object-format writers, one per target family. Each is always compiled; Link() selects the one matching
+    /// `targetOs`.
+    [[nodiscard]] bool LinkPe32Plus(const std::filesystem::path &outputPath);
     [[nodiscard]] bool LinkElf64(const std::filesystem::path &outputPath);
     [[nodiscard]] bool LinkMachO64(const std::filesystem::path &outputPath);
+    [[nodiscard]] bool WriteStaticLibrary(const std::filesystem::path &outputPath);
 };
 } // namespace Rux

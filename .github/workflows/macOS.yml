@@ -43,9 +43,16 @@ jobs:
           persist-credentials: false
 
       # macOS ships Apple Clang, which lags upstream and lacks full C++26
-      # support, so install LLVM Clang 22 from Homebrew to match Linux.
+      # support, so install LLVM Clang 22 from Homebrew to match Linux. The
+      # runner image ships with third-party taps Homebrew no longer trusts by
+      # default; nothing here uses them, so drop them rather than trusting
+      # them or silencing the check.
       - name: Install Clang 22
         run: |
+          brew untap aws/tap || true
+          if brew list --versions llvm@20 >/dev/null; then
+            brew unlink llvm@20
+          fi
           brew install llvm@22
           echo "$(brew --prefix llvm@22)/bin" >> "$GITHUB_PATH"
 
@@ -68,12 +75,32 @@ jobs:
         run: ctest --test-dir Build --output-on-failure -C Release
 
       - name: Upload binary artifact
+        id: upload
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: Bin/rux
           if-no-files-found: error
           retention-days: 7
+
+      # Hosted macOS runners intermittently fail CreateArtifact with DNS
+      # errors (ENOTFOUND) and the action has no built-in retry, so pause
+      # for the blip to clear and try once more. Overwrite in case the
+      # first attempt created the artifact before failing.
+      - name: Wait before upload retry
+        if: steps.upload.outcome == 'failure'
+        run: sleep 15
+
+      - name: Upload binary artifact (retry)
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: Bin/rux
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
   test:
     name: Test (${{ matrix.label }})
@@ -112,4 +139,39 @@ jobs:
         run: |
           ./Bin/rux check
           ./Bin/rux lint
-          ./Bin/rux test --release
+
+      - name: Run Rux tests
+        run: ./Bin/rux test --release
+
+      - name: Run Apple Silicon native runtime fixtures
+        if: matrix.arch == 'aarch64'
+        run: sh Tests/Native/MacOSAArch64/Verify.sh ./Bin/rux
+
+  cross:
+    name: Cross (x86-64 compiler, AArch64 target)
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download x86-64 compiler artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: rux-macos-x86_64
+          path: Bin
+
+      - name: Verify Rux workspace for macos-aarch64
+        run: |
+          chmod +x Bin/rux
+          /usr/bin/arch -x86_64 ./Bin/rux check --target macos-aarch64
+          /usr/bin/arch -x86_64 ./Bin/rux test --release --target macos-aarch64
+
+      # Artifacts do not preserve executable permissions. VerifyRosetta also
+      # checks that this is a thin x86-64 compiler before launching it through
+      # Rosetta; every produced fixture is launched directly as ARM64.
+      - name: Run Apple Silicon cross-compiler runtime fixtures
+        run: sh Tests/Native/MacOSAArch64/VerifyRosetta.sh ./Bin/rux

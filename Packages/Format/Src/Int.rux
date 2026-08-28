@@ -1,16 +1,34 @@
-import Text::{ String, StringBuilder };
+// The decimal text of an `int`.
+//
+// A negative value opens with a minus sign; a positive one carries no sign, since a sign that is always there is
+// noise and one that is there on request belongs to the placeholder rather than the value.
 
-// The decimal text of an int, the signed integer that is as wide as a
-// pointer. It is a type of its own rather than a name for int64, so it needs
-// its own conversion even where the two happen to be the same width.
-func ToString(value: int) -> String {
-    var builder = StringBuilder::WithCapacity(20);
-    WriteInt(@builder, value as int64);
-    return builder.IntoString();
+// `int` is a type of its own rather than a name for `int64`, so it needs its own implementation even where
+// the two happen to be the same width. Widening to `int64` first is what makes that implementation one line.
+
+import Text::TextError;
+
+extend int : Display {
+    /// Writes this value's digits.
+    ///
+    /// Allocates nothing: the digits go into a buffer on the stack and reach the writer in one call.
+    ///
+    /// https://rux-lang.dev/docs/api/format/int/format
+    pub func Format(self: *int, writer: &var TextWriter, spec: FormatSpec) -> TextError {
+        let wide = *self as int64;
+        // The magnitude is taken in uint64 rather than by negating in int64, because the most negative value has
+        // no positive counterpart there.
+        let negative = wide < 0i64;
+        let magnitude = negative ? ~(wide as uint64) + 1u64 : wide as uint64;
+        return WriteIntegerSpec(writer, spec, magnitude, negative);
+    }
 }
 
-extend int : Stringable {
-    func ToString(self) -> String {
-        return ToString(*self);
+extend int : Debug {
+    /// The same digits: a number reads the same whoever is looking.
+    ///
+    /// https://rux-lang.dev/docs/api/format/int/format-debug
+    pub func FormatDebug(self: *int, writer: &var TextWriter, spec: FormatSpec) -> TextError {
+        return self.Format(writer, spec);
     }
 }

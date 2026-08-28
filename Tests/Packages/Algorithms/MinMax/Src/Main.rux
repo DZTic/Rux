@@ -1,0 +1,118 @@
+import Algorithms::{ Clamp, ClampBy, Max, MaxIndex, MaxIndexBy, Min, MinIndex, MinIndexBy, MinMaxIndex,
+                     MinMaxIndexBy };
+import Core::{ Assert, Ordering };
+
+// The smallest and largest of a sequence. Two things are worth pinning down beyond the obvious: an empty slice has
+// no answer at all rather than a sentinel one, and a tie goes to the earliest index -- which is only observable if
+// the elements carry something the ordering ignores, so they do.
+
+// Ordered by key alone, so equivalent-but-distinct elements exist and the choice among them is observable.
+pub struct Ranked {
+    key: int32;
+    origin: int32;
+}
+
+extend Ranked {
+    pub func <(self: &Ranked, other: Ranked) -> bool {
+        return self.key < other.key;
+    }
+}
+
+func ByKeyDescending(left: Ranked, right: Ranked) -> Ordering {
+    if right.key < left.key {
+        return Ordering::Less;
+    }
+    if left.key < right.key {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
+func Main() -> int {
+    var storage: int32[6];
+    storage[0] = 5;
+    storage[1] = 2;
+    storage[2] = 9;
+    storage[3] = 2;
+    storage[4] = 9;
+    storage[5] = 4;
+    let items = Slice<int32> { data: @storage[0], length: 6 };
+    let empty = Slice<int32> { data: null, length: 0 };
+    let single = Slice<int32> { data: @storage[0], length: 1 };
+
+    var at: uint = 0;
+    Assert(MinIndex<int32>(items).TryIntoValue(@at) && at == 1, "the smallest element is found");
+    Assert(MaxIndex<int32>(items).TryIntoValue(@at) && at == 2, "and the largest");
+    Assert(MinIndex<int32>(single).TryIntoValue(@at) && at == 0, "a single element is both");
+    Assert(MaxIndex<int32>(single).TryIntoValue(@at) && at == 0, "smallest and largest");
+    Assert(MinIndex<int32>(empty).IsNone(), "an empty slice has no smallest element");
+    Assert(MaxIndex<int32>(empty).IsNone(), "and no largest");
+
+    // Ties go to the earliest, which the repeated 2 and 9 above are there to show.
+    Assert(MinIndex<int32>(items).TryIntoValue(@at) && at == 1, "the earliest of equal smallest elements wins");
+    Assert(MaxIndex<int32>(items).TryIntoValue(@at) && at == 2, "and the earliest of equal largest ones");
+
+    // One pass gives both, and agrees with the two separate searches.
+    var low: uint = 0;
+    var high: uint = 0;
+    Assert(MinMaxIndex<int32>(items, @low, @high), "one pass reports both ends");
+    Assert(low == 1, "with the same smallest as the single-ended search");
+    Assert(high == 2, "and the same largest");
+    low = 99;
+    high = 99;
+    Assert(!MinMaxIndex<int32>(empty, @low, @high), "an empty slice reports neither");
+    Assert(low == 99 && high == 99, "and writes nothing");
+
+    // A comparator decides for a type with no ordering, and reversing it swaps the ends.
+    var ranked: Ranked[5];
+    ranked[0] = Ranked { key: 3, origin: 100 };
+    ranked[1] = Ranked { key: 1, origin: 101 };
+    ranked[2] = Ranked { key: 8, origin: 102 };
+    ranked[3] = Ranked { key: 1, origin: 103 };
+    ranked[4] = Ranked { key: 8, origin: 104 };
+    let records = Slice<Ranked> { data: @ranked[0], length: 5 };
+
+    Assert(MinIndex<Ranked>(records).TryIntoValue(@at) && at == 1, "the type's own ordering finds the smallest");
+    Assert(ranked[at].origin == 101, "and takes the earliest of the tie");
+    Assert(MaxIndex<Ranked>(records).TryIntoValue(@at) && at == 2, "and the largest");
+    Assert(ranked[at].origin == 102, "also the earliest of its tie");
+
+    Assert(MinIndexBy<Ranked>(records, ByKeyDescending).TryIntoValue(@at) && at == 2,
+           "a reversed comparator makes the largest key the smallest element");
+    Assert(ranked[at].origin == 102, "still taking the earliest of the tie");
+    Assert(MaxIndexBy<Ranked>(records, ByKeyDescending).TryIntoValue(@at) && at == 1,
+           "and the smallest key the largest element");
+    Assert(MinIndexBy<Ranked>(Slice<Ranked> { data: null, length: 0 }, ByKeyDescending).IsNone(),
+           "an empty slice has no answer under any comparator");
+
+    Assert(MinMaxIndexBy<Ranked>(records, ByKeyDescending, @low, @high), "one pass under a comparator reports both");
+    Assert(low == 2 && high == 1, "with the ends the comparator says");
+
+    // The two-value forms, including which side a tie keeps.
+    Assert(Min<int32>(3, 7) == 3, "the smaller of two");
+    Assert(Max<int32>(3, 7) == 7, "and the larger");
+    Assert(Min<int32>(4, 4) == 4, "a tie has one answer");
+    let first = Ranked { key: 2, origin: 200 };
+    let second = Ranked { key: 2, origin: 201 };
+    Assert(Min<Ranked>(first, second).origin == 200, "and the left side keeps a tie");
+    Assert(Max<Ranked>(first, second).origin == 200, "at both ends");
+
+    // Clamping, including the range that cannot be satisfied.
+    Assert(Clamp<int32>(5, 0, 10) == 5, "a value inside the range is itself");
+    Assert(Clamp<int32>(-3, 0, 10) == 0, "a value below is raised to the low end");
+    Assert(Clamp<int32>(42, 0, 10) == 10, "a value above is lowered to the high end");
+    Assert(Clamp<int32>(0, 0, 10) == 0, "the low end is inside the range");
+    Assert(Clamp<int32>(10, 0, 10) == 10, "and so is the high end");
+    Assert(Clamp<int32>(5, 10, 0) == 10, "an inverted range has no right answer, so the low end is returned");
+
+    Assert(ClampBy<Ranked>(Ranked { key: 5, origin: 0 }, Ranked { key: 8, origin: 0 }, Ranked { key: 1, origin: 0 },
+                           ByKeyDescending)
+               .key == 5,
+           "a comparator clamps into its own order");
+    Assert(ClampBy<Ranked>(Ranked { key: 9, origin: 0 }, Ranked { key: 8, origin: 0 }, Ranked { key: 1, origin: 0 },
+                           ByKeyDescending)
+               .key == 8,
+           "raising to what that order calls the low end");
+
+    return 0;
+}

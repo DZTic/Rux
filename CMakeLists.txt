@@ -1,7 +1,14 @@
 cmake_minimum_required(VERSION 3.30...4.3)
-project(Rux VERSION 0.3.0 LANGUAGES CXX)
+project(Rux VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
+
+if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "Rux requires upstream Clang 22.1 or newer")
+endif ()
+if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 22.1)
+    message(FATAL_ERROR "Rux requires Clang 22.1 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
+endif ()
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +27,14 @@ option(RUX_BUILD_TESTS "Build the C++ unit tests (Tests/Unit)" OFF)
 
 # The compiler is a self-contained component; its target lives in Compiler/.
 add_subdirectory(Compiler)
+
+# Offline tooling: the Unicode table generator, run by hand when the UCD data under Tools/UnicodeGen/Data changes.
+# Its output is committed, so nothing in an ordinary build depends on it.
+add_subdirectory(Tools/UnicodeGen)
+
+# The math reference generator, run by hand when a boundary vector set needs regenerating.
+add_subdirectory(Tools/MathVectors)
+add_subdirectory(Tools/FloatVectors)
 
 if (RUX_BUILD_TESTS)
     enable_testing()

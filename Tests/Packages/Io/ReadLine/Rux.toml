@@ -1,11 +1,16 @@
+[Manifest]
+Version = 1
+
 [Package]
 Name = "ReadLine"
 Version = "0.1.0"
-Type = "bin"
+Type = "Executable"
 Description = "Package test for Io: ReadLine"
 
 [Dependencies]
+Allocator = { Path = "../../../../Packages/Allocator" }
 Io = { Path = "../../../../Packages/Io" }
+Text = { Path = "../../../../Packages/Text" }
 
 [Build]
 Output = "../../../../Bin/Tests/Packages/Io"

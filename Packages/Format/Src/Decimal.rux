@@ -1,5 +1,3 @@
-import Text::StringBuilder;
-
 // The float conversions all funnel through here. What separates a float32
 // from a float64 is only how many digits it can carry before the noise of
 // the binary representation shows through, so that count is a parameter and
@@ -8,10 +6,13 @@ import Text::StringBuilder;
 // The digits of a finite, non-zero magnitude, and the point placed by the
 // decimal exponent. `significant` is how many digits to generate before
 // rounding: fifteen for a float64, seven for a float32.
-func WriteDecimal(builder: *StringBuilder, value: float64, significant: uint) {
+/// Provides the public `WriteDecimal` operation.
+///
+/// https://rux-lang.dev/docs/api/format/write-decimal
+pub func WriteDecimal(cursor: &var ByteCursor, value: float64, significant: uint) {
     var abs = value;
     if value < 0.0 {
-        builder.Append(c8'-');
+        cursor.Push(c8'-');
         abs = -value;
     }
 
@@ -80,9 +81,9 @@ func WriteDecimal(builder: *StringBuilder, value: float64, significant: uint) {
     // leading zeros than on digits, and one at or above the digit count
     // would spend it on trailing ones.
     if exp10 < -4 || exp10 >= significant as int {
-        WriteScientific(builder, digits, count, exp10);
+        WriteScientific(cursor, digits, count, exp10);
     } else {
-        WriteFixed(builder, digits, count, exp10);
+        WriteFixed(cursor, digits, count, exp10);
     }
 }
 
@@ -90,20 +91,20 @@ func WriteDecimal(builder: *StringBuilder, value: float64, significant: uint) {
 // exponent marker: 1.25, 0.001, 12000.0. A fractional part is always
 // written, so the text still reads as a float when the value has no fraction
 // of its own to show.
-func WriteFixed(builder: *StringBuilder, digits: Slice<char8>, count: uint, exp10: int) {
+func WriteFixed(cursor: &var ByteCursor, digits: Slice<char8>, count: uint, exp10: int) {
     if exp10 < 0 {
         // Below one, so the text opens with a zero and the point, then as
         // many more zeros as the exponent calls for: -1 puts the first digit
         // straight after the point, -3 leaves two zeros in front of it.
-        builder.Append("0.");
+        cursor.PushBytes("0.");
         var pad = exp10 + 1;
         while pad < 0 {
-            builder.Append(c8'0');
+            cursor.Push(c8'0');
             pad++;
         }
 
         for i in 0..count {
-            builder.Append(digits[i]);
+            cursor.Push(digits[i]);
         }
         return;
     }
@@ -115,22 +116,22 @@ func WriteFixed(builder: *StringBuilder, digits: Slice<char8>, count: uint, exp1
     var i: uint = 0;
     while i < length {
         if i < count {
-            builder.Append(digits[i]);
+            cursor.Push(digits[i]);
         } else {
-            builder.Append(c8'0');
+            cursor.Push(c8'0');
         }
         i++;
     }
 
-    builder.Append(c8'.');
+    cursor.Push(c8'.');
     if count <= length {
-        builder.Append(c8'0');
+        cursor.Push(c8'0');
         return;
     }
 
     var j = length;
     while j < count {
-        builder.Append(digits[j]);
+        cursor.Push(digits[j]);
         j++;
     }
 }
@@ -138,33 +139,35 @@ func WriteFixed(builder: *StringBuilder, digits: Slice<char8>, count: uint, exp1
 // One digit, the point, the rest, and the exponent: 1.5e+20, 2.5e-07. The
 // exponent carries a sign and at least two digits, so the tail keeps a
 // steady width across the range.
-func WriteScientific(builder: *StringBuilder, digits: Slice<char8>, count: uint, exp10: int) {
-    builder.Append(digits[0]);
-    builder.Append(c8'.');
+func WriteScientific(cursor: &var ByteCursor, digits: Slice<char8>, count: uint, exp10: int) {
+    cursor.Push(digits[0]);
+    cursor.Push(c8'.');
     if count == 1 {
-        builder.Append(c8'0');
+        cursor.Push(c8'0');
     } else {
         var i: uint = 1;
         while i < count {
-            builder.Append(digits[i]);
+            cursor.Push(digits[i]);
             i++;
         }
     }
 
-    builder.Append(c8'e');
+    cursor.Push(c8'e');
     var exp = exp10;
     if exp < 0 {
-        builder.Append(c8'-');
+        cursor.Push(c8'-');
         exp = -exp;
     } else {
-        builder.Append(c8'+');
+        cursor.Push(c8'+');
     }
 
     // The digits come out least significant first and go back reversed.
-    // Three of them are enough, since the exponent of a float64 reaches 308,
-    // and it never reaches zero: this notation is only chosen for a value
+    // A float64's exponent stops at three digits, but the wide widths share
+    // this writer and a float512's reaches 1262611: seven digits, and a
+    // buffer that held three wrote its fourth past the end. The exponent
+    // never reaches zero, since this notation is only chosen for a value
     // whose exponent falls outside [-4, significant).
-    var expDigits: char8[4];
+    var expDigits: char8[8];
     var length: uint = 0;
     var rest = exp as uint;
     while rest > 0 {
@@ -174,13 +177,13 @@ func WriteScientific(builder: *StringBuilder, digits: Slice<char8>, count: uint,
     }
 
     if length < 2 {
-        builder.Append(c8'0');
+        cursor.Push(c8'0');
     }
 
     var i = length;
     while i > 0 {
         i--;
-        builder.Append(expDigits[i]);
+        cursor.Push(expDigits[i]);
     }
 }
 
@@ -223,4 +226,76 @@ func ScaleByPow10(value: float64, exp: int) -> float64 {
         result /= Pow10((-rest) as uint);
     }
     return result;
+}
+
+// The value with `precision` digits after the point, rounded half away from zero.
+//
+// Only for values whose scaled magnitude fits an integer word: precision formatting is for human-scale numbers,
+// and a value past that renders shortest instead of pretending to a precision the arithmetic cannot honour. The
+// rounding happens once, in the scaled integer, so the carry out of ".995" propagates into the integer part the
+// way arithmetic says it should.
+func WriteFixedPrecision(cursor: &var ByteCursor, value: float64, precision: uint) {
+    var abs = value;
+    if value < 0.0 {
+        cursor.Push(c8'-');
+        abs = -value;
+    }
+
+    let scale = Pow10(precision);
+    let scaled = abs * scale + 0.5;
+    var units = scaled as uint64;
+    var divisor: uint64 = 1;
+    var counted: uint = 0;
+    while counted < precision {
+        divisor = divisor * 10u64;
+        counted = counted + 1;
+    }
+    let whole = units / divisor;
+    let fraction = units % divisor;
+
+    var digits: char8[20];
+    var count: uint = 0;
+    var rest = whole;
+    if rest == 0u64 {
+        digits[0] = c8'0';
+        count = 1;
+    }
+    while rest > 0u64 {
+        digits[count] = (rest % 10u64 + 48u64) as char8;
+        count = count + 1;
+        rest = rest / 10u64;
+    }
+    var index = count;
+    while index > 0 {
+        index = index - 1;
+        cursor.Push(digits[index]);
+    }
+
+    if precision == 0 {
+        return;
+    }
+    cursor.Push(c8'.');
+    var fracDigits: char8[20];
+    var fracCount: uint = 0;
+    var fracRest = fraction;
+    while fracCount < precision {
+        fracDigits[fracCount] = (fracRest % 10u64 + 48u64) as char8;
+        fracCount = fracCount + 1;
+        fracRest = fracRest / 10u64;
+    }
+    index = fracCount;
+    while index > 0 {
+        index = index - 1;
+        cursor.Push(fracDigits[index]);
+    }
+}
+
+// Whether `value` is one precision formatting can honour: finite, and small enough that scaling it by the
+// precision still fits the integer word the rounding happens in.
+func FitsPrecision(value: float64, precision: uint) -> bool {
+    if !IsFinite(value) || precision > 17 {
+        return false;
+    }
+    let abs = value < 0.0 ? -value : value;
+    return abs * Pow10(precision) < 9007199254740992.0;
 }

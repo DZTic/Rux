@@ -1,0 +1,151 @@
+import Algorithms::{ AllOf, AnyOf, Compare, CompareBy, Contains, Count, CountWhere, IndexOf, IndexWhere,
+                     LastIndexOf, LastIndexWhere, Mismatch, NoneOf, SequenceEqual };
+import Core::{ Assert, Ordering };
+
+// The linear queries. What is worth checking is not that a search finds a match -- it is the boundaries: an empty
+// slice, a match at the first position, a match at the last, no match at all, and the difference between the first
+// match and the last when there are several.
+
+// Equality covers both fields, so a match on one field alone must not pass for equality.
+pub struct Record {
+    key: int32;
+    origin: int32;
+}
+
+extend Record {
+    pub func ==(self: &Record, other: Record) -> bool {
+        return self.key == other.key && self.origin == other.origin;
+    }
+
+    pub func !=(self: &Record, other: Record) -> bool {
+        return !(self == other);
+    }
+}
+
+func ByKey(left: Record, right: Record) -> Ordering {
+    if left.key < right.key {
+        return Ordering::Less;
+    }
+    if right.key < left.key {
+        return Ordering::Greater;
+    }
+    return Ordering::Equal;
+}
+
+func IsEven(value: int32) -> bool {
+    return value % 2 == 0;
+}
+
+func IsNegative(value: int32) -> bool {
+    return value < 0;
+}
+
+func Ints(data: *int32, length: uint) -> Slice<int32> {
+    return Slice<int32> { data: data, length: length };
+}
+
+func Main() -> int {
+    let original = Record { key: 7i32, origin: 11i32 };
+    let copied = original;
+    Assert(copied == original, "plain algorithm elements copy structurally");
+
+    var storage: int32[7];
+    storage[0] = 4;
+    storage[1] = 7;
+    storage[2] = 4;
+    storage[3] = 2;
+    storage[4] = 9;
+    storage[5] = 4;
+    storage[6] = 1;
+    let items = Ints(@storage[0], 7);
+    let empty = Ints(null, 0);
+
+    // Presence and counting.
+    Assert(Contains<int32>(items, 4), "a value that is present is found");
+    Assert(!Contains<int32>(items, 5), "and one that is not, is not");
+    Assert(!Contains<int32>(empty, 4), "an empty slice contains nothing");
+    Assert(Count<int32>(items, 4) == 3, "every occurrence is counted");
+    Assert(Count<int32>(items, 5) == 0, "a value that is absent occurs zero times");
+    Assert(Count<int32>(empty, 4) == 0, "and an empty slice has none of anything");
+
+    // First and last are genuinely different answers when a value repeats.
+    var at: uint = 0;
+    Assert(IndexOf<int32>(items, 4).TryIntoValue(@at), "a present value has an index");
+    Assert(at == 0, "which is the first occurrence");
+    Assert(LastIndexOf<int32>(items, 4).TryIntoValue(@at), "and a last one");
+    Assert(at == 5, "which is the last occurrence");
+    Assert(IndexOf<int32>(items, 1).TryIntoValue(@at) && at == 6, "a match at the very end is found");
+    Assert(LastIndexOf<int32>(items, 7).TryIntoValue(@at) && at == 1, "and a single match is both first and last");
+    Assert(IndexOf<int32>(items, 5).IsNone(), "an absent value has no index");
+    Assert(LastIndexOf<int32>(items, 5).IsNone(), "from either end");
+    Assert(IndexOf<int32>(empty, 4).IsNone(), "and an empty slice never matches");
+
+    // Predicates answer the same questions without an equality.
+    Assert(IndexWhere<int32>(items, IsEven).TryIntoValue(@at) && at == 0, "the first accepted element");
+    Assert(LastIndexWhere<int32>(items, IsEven).TryIntoValue(@at) && at == 5, "and the last");
+    Assert(IndexWhere<int32>(items, IsNegative).IsNone(), "a predicate nothing satisfies finds nothing");
+    Assert(LastIndexWhere<int32>(items, IsNegative).IsNone(), "from either end");
+    Assert(CountWhere<int32>(items, IsEven) == 4, "and counts what it accepts");
+    Assert(CountWhere<int32>(empty, IsEven) == 0, "an empty slice satisfies no predicate anywhere");
+
+    // The universal and existential claims, including what they mean of nothing.
+    Assert(!AllOf<int32>(items, IsEven), "not every element is even");
+    Assert(AnyOf<int32>(items, IsEven), "but some element is");
+    Assert(!NoneOf<int32>(items, IsEven), "so it is not true that none is");
+    Assert(NoneOf<int32>(items, IsNegative), "while none is negative");
+    Assert(!AnyOf<int32>(items, IsNegative), "which is the same claim from the other side");
+    Assert(AllOf<int32>(empty, IsNegative), "an empty slice satisfies every universal claim");
+    Assert(!AnyOf<int32>(empty, IsNegative), "and no existential one");
+    Assert(NoneOf<int32>(empty, IsNegative), "which makes it vacuously free of anything");
+
+    // Mismatch and equality, including the case where one slice is a prefix of the other.
+    var other: int32[7];
+    var index: uint = 0;
+    while index < 7 {
+        other[index] = storage[index];
+        index++;
+    }
+    Assert(Mismatch<int32>(items, Ints(@other[0], 7)).IsNone(), "identical slices never differ");
+    Assert(SequenceEqual<int32>(items, Ints(@other[0], 7)), "and are equal");
+    other[3] = 100;
+    Assert(Mismatch<int32>(items, Ints(@other[0], 7)).TryIntoValue(@at) && at == 3, "the first difference is reported");
+    Assert(!SequenceEqual<int32>(items, Ints(@other[0], 7)), "and makes them unequal");
+    other[3] = storage[3];
+    Assert(Mismatch<int32>(items, Ints(@other[0], 4)).TryIntoValue(@at) && at == 4,
+           "a prefix differs where the shorter one ends");
+    Assert(!SequenceEqual<int32>(items, Ints(@other[0], 4)), "and a prefix is not equal to the whole");
+    Assert(SequenceEqual<int32>(empty, Ints(null, 0)), "two empty slices are equal");
+    Assert(Mismatch<int32>(empty, Ints(null, 0)).IsNone(), "and never differ");
+
+    // Lexicographic ordering: the first difference decides, and length breaks a tie.
+    Assert(Compare<int32>(items, Ints(@other[0], 7)).IsEqual(), "identical slices compare equal");
+    Assert(Compare<int32>(Ints(@other[0], 4), items).IsLess(), "a proper prefix is the smaller");
+    Assert(Compare<int32>(items, Ints(@other[0], 4)).IsGreater(), "and the whole is the larger");
+    Assert(Compare<int32>(empty, items).IsLess(), "an empty slice is smaller than any non-empty one");
+    Assert(Compare<int32>(empty, Ints(null, 0)).IsEqual(), "and equal to another empty one");
+    other[1] = 6;
+    Assert(Compare<int32>(Ints(@other[0], 7), items).IsLess(), "the first differing element decides");
+    other[1] = 8;
+    Assert(Compare<int32>(Ints(@other[0], 7), items).IsGreater(), "in whichever direction it differs");
+
+    // A comparator orders elements that have no ordering of their own.
+    var left: Record[2];
+    var right: Record[2];
+    left[0] = Record { key: 1, origin: 0 };
+    left[1] = Record { key: 5, origin: 0 };
+    right[0] = Record { key: 1, origin: 9 };
+    right[1] = Record { key: 7, origin: 9 };
+    let leftSlice = Slice<Record> { data: @left[0], length: 2 };
+    let rightSlice = Slice<Record> { data: @right[0], length: 2 };
+    Assert(CompareBy<Record>(leftSlice, rightSlice, ByKey).IsLess(), "a comparator decides the order");
+    Assert(CompareBy<Record>(rightSlice, leftSlice, ByKey).IsGreater(), "in both directions");
+    Assert(CompareBy<Record>(leftSlice, leftSlice, ByKey).IsEqual(), "and a slice equals itself");
+
+    // Equality covers every field, so records equal on one field alone are not equal.
+    Assert(!SequenceEqual<Record>(leftSlice, rightSlice), "records equal on one field are not equal records");
+    Assert(CompareBy<Record>(Slice<Record> { data: @left[0], length: 1 },
+                             Slice<Record> { data: @right[0], length: 1 }, ByKey).IsEqual(),
+           "though a comparator that reads one field says they are equivalent");
+
+    return 0;
+}

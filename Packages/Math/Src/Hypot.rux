@@ -5,7 +5,14 @@
 // The trick in the last step is that a*a is re-associated around the high
 // half of a, whose square is exact, so the sum handed to Sqrt has almost
 // twice the precision of a plain x*x + y*y.
-func Hypot(x: float64, y: float64) -> float64 {
+// **Accuracy: error at most 1 ulp.** The scaling below is what earns it: the
+// naive square-and-add overflows for arguments whose square does not fit and
+// underflows to zero for arguments whose square is subnormal, both of which
+// lose the answer entirely rather than merely rounding it.
+/// Provides the public `Hypot` operation.
+///
+/// https://rux-lang.dev/docs/api/math/hypot
+pub func Hypot(x: float64, y: float64) -> float64 {
     var a = Abs(x);
     var b = Abs(y);
     var ha = FloatBits(a) >> 32u64;
@@ -93,6 +100,9 @@ func Hypot(x: float64, y: float64) -> float64 {
     return w;
 }
 
-func Hypot(x: float32, y: float32) -> float32 {
+/// Provides the public `Hypot` operation.
+///
+/// https://rux-lang.dev/docs/api/math/hypot
+pub func Hypot(x: float32, y: float32) -> float32 {
     return Hypot(x as float64, y as float64) as float32;
 }

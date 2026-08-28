@@ -1,4 +1,5 @@
-import Text::{ String, StringBuilder };
+import Core::Slice;
+import Text::TextError;
 
 // The largest finite float64. Anything past it is an infinity, which is how
 // the tests below classify a value without reading its bits.
@@ -14,51 +15,81 @@ const Digits64 = 15u;
 
 // Whether the value is a NaN. A NaN is the only value not equal to itself,
 // so this needs no bit pattern to recognise one.
-func IsNan(value: float64) -> bool {
+/// Provides the public `IsNan` operation.
+///
+/// https://rux-lang.dev/docs/api/format/is-nan
+pub func IsNan(value: float64) -> bool {
     return value != value;
 }
 
 // Whether the value is one of the two infinities. Every comparison against a
 // NaN is false, so a NaN answers false here rather than being mistaken for
 // an infinity.
-func IsInfinite(value: float64) -> bool {
+/// Provides the public `IsInfinite` operation.
+///
+/// https://rux-lang.dev/docs/api/format/is-infinite
+pub func IsInfinite(value: float64) -> bool {
     return value > MaxFinite64 || value < -MaxFinite64;
 }
 
 // Whether the value is an ordinary number: neither a NaN nor an infinity.
-func IsFinite(value: float64) -> bool {
+/// Provides the public `IsFinite` operation.
+///
+/// https://rux-lang.dev/docs/api/format/is-finite
+pub func IsFinite(value: float64) -> bool {
     return value >= -MaxFinite64 && value <= MaxFinite64;
 }
 
-// The decimal text of a float64, in a String the caller owns and frees.
-// Fixed notation while the exponent stays in [-4, 15), scientific outside
-// it, where fixed notation would be mostly zeros. See Digits64 for what the
-// digits are worth.
-func ToString(value: float64) -> String {
-    var builder = StringBuilder::WithCapacity(24);
-    WriteFloat(@builder, value);
-    return builder.IntoString();
+extend float64 : Display {
+    /// Writes this value's decimal text.
+    ///
+    /// Allocates nothing: the digits go into a buffer on the stack and reach the writer in one call. Fifty bytes is
+    /// more than the longest rendering -- sign, digits, point and exponent -- can need.
+    ///
+    /// https://rux-lang.dev/docs/api/format/float64/format
+    pub func Format(self: *float64, writer: &var TextWriter, spec: FormatSpec) -> TextError {
+        var storage: char8[52];
+        var cursor = ByteCursor(MutableSlice::From<char8>(@storage[2], 50));
+        // Precision means digits after the point, honoured where the arithmetic can honour it: a value too large
+        // to scale into a word renders shortest instead of pretending.
+        if spec.hasPrecision && FitsPrecision(*self, spec.precision) {
+            WriteFixedPrecision(cursor, *self, spec.precision);
+        }
+        else {
+            WriteFloat(cursor, *self);
+        }
+        var rendered = cursor.Written();
+        // A requested sign goes in front of a value that has none of its own; a NaN carries no sign to show.
+        if spec.showSign && rendered.length > 0 && rendered.data[0] != c8'-' && rendered.data[0] != c8'N' {
+            storage[1] = c8'+';
+            rendered = Slice<char8> { data: @storage[1], length: rendered.length + 1 };
+        }
+        return WriteAligned(writer, spec, rendered, true);
+    }
 }
 
-extend float64 : Stringable {
-    func ToString(self) -> String {
-        return ToString(*self);
+extend float64 : Debug {
+    /// The same text.
+    ///
+    /// https://rux-lang.dev/docs/api/format/float64/format-debug
+    pub func FormatDebug(self: *float64, writer: &var TextWriter, spec: FormatSpec) -> TextError {
+        return self.Format(writer, spec);
     }
 }
 
 // Appends the text of a float64 to a builder. This is what ToString is built
 // on, and what a caller who is already accumulating should reach for: it
 // costs no String of its own.
-func WriteFloat(builder: *StringBuilder, value: float64) {
+func WriteFloat(cursor: &var ByteCursor, value: float64) {
     if IsNan(value) {
-        builder.Append("NaN");
+        cursor.PushBytes("NaN");
         return;
     }
     if IsInfinite(value) {
         if value < 0.0 {
-            builder.Append("-Inf");
+            cursor.PushBytes("-Inf");
         } else {
-            builder.Append("Inf");
+            cursor.PushBytes("Inf");
         }
         return;
     }
@@ -68,10 +99,10 @@ func WriteFloat(builder: *StringBuilder, value: float64) {
         // that is the one place in arithmetic where the two zeros part
         // company.
         if 1.0 / value < 0.0 {
-            builder.Append(c8'-');
+            cursor.Push(c8'-');
         }
-        builder.Append("0.0");
+        cursor.PushBytes("0.0");
         return;
     }
-    WriteDecimal(builder, value, Digits64);
+    WriteDecimal(cursor, value, Digits64);
 }

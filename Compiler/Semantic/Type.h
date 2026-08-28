@@ -3,10 +3,11 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Rux {
-// Resolved type representation used by the semantic analyzer.
+/// Resolved type representation used by the semantic analyzer.
 struct TypeRef {
     enum class Kind {
         Unknown, // unresolved / error recovery
@@ -14,23 +15,43 @@ struct TypeRef {
         Bool8,
         Bool16,
         Bool32,
+        Bool64,
+        Bool128,
+        Bool256,
+        Bool512,
         Char8,
         Char16,
         Char32,
+        Char64,
+        Char128,
+        Char256,
+        Char512,
         Int8,
         Int16,
         Int32,
         Int64,
+        Int128,
+        Int256,
+        Int512,
         UInt8,
         UInt16,
         UInt32,
         UInt64,
+        UInt128,
+        UInt256,
+        UInt512,
         Int,
         UInt, // platform-dependent: 64-bit on x86-64, 32-bit on x86
+        Float8,
+        Float16,
         Float32,
         Float64,
-        Str,              // String
+        Float80,
+        Float128,
+        Float256,
+        Float512,         // String
         Pointer,          // *T  — inner[0] = pointee
+        Reference,        // &T  — inner[0] = referent
         Array,            // T[] / T[N] — inner[0] = element; arrayLength is absent for a flexible tail
         Range,            // start..end — inner[0] = element
         RangeInclusive,   // start..=end — inner[0] = element
@@ -43,6 +64,7 @@ struct TypeRef {
         TypeParam,        // generic parameter T — name = param name
         Func,             // func(...) -> T — inner[0..n-2] = params, inner[n-1] =
         // return
+
         // Aliases — must come after all concrete values so they don't shift
         // the counter
         Bool = Bool8,    // bool is an alias for bool8
@@ -57,14 +79,23 @@ struct TypeRef {
     std::optional<std::uint64_t> arrayLength;
     bool isVariadic = false; // Func kind: trailing C-style ... (extern) or
     // Rux variadic; extra call args are allowed
-    bool isMut = false; // this type, viewed as a pointee, is writable
-                        // (*var T). The default is read-only (*T). Deliberately
-                        // NOT part of operator== so it never leaks onto loaded
-                        // value types and breaks overload resolution.
+    bool isMut = false; // this type, viewed as a pointee or referent, is writable
+                        // (*var T / &var T). The default is read-only. Pointer
+                        // mutability is deliberately not part of operator== so
+                        // it never leaks onto loaded value types; reference
+                        // identity handles it at the enclosing type.
 
     // Factories
     static TypeRef MakeUnknown() {
         return {};
+    }
+
+    /// The one factory for a primitive kind. A primitive carries nothing but its kind, so a table that already knows
+    /// the kind builds the type from it rather than routing through a per-width named factory.
+    static TypeRef MakePrimitive(const Kind primitive) {
+        TypeRef t;
+        t.kind = primitive;
+        return t;
     }
 
     static TypeRef MakeOpaque() {
@@ -118,12 +149,6 @@ struct TypeRef {
     static TypeRef MakeChar() {
         TypeRef t;
         t.kind = Kind::Char32;
-        return t;
-    }
-
-    static TypeRef MakeStr() {
-        TypeRef t;
-        t.kind = Kind::Str;
         return t;
     }
 
@@ -230,6 +255,13 @@ struct TypeRef {
         return t;
     }
 
+    static TypeRef MakeReference(TypeRef referent) {
+        TypeRef t;
+        t.kind = Kind::Reference;
+        t.inner.push_back(std::move(referent));
+        return t;
+    }
+
     static TypeRef MakeArray(TypeRef elem, std::optional<std::uint64_t> length = std::nullopt) {
         TypeRef t;
         t.kind = Kind::Array;
@@ -288,10 +320,8 @@ struct TypeRef {
         return kind == Kind::Opaque;
     }
 
-    [[nodiscard]] bool IsBool() const noexcept {
-        return kind == Kind::Bool8 || kind == Kind::Bool16 || kind == Kind::Bool32;
-    }
-
+    [[nodiscard]] bool IsBool() const noexcept;
+    [[nodiscard]] bool IsChar() const noexcept;
     [[nodiscard]] bool IsNumeric() const noexcept;
     [[nodiscard]] bool IsInteger() const noexcept;
 
@@ -320,11 +350,21 @@ struct TypeRef {
     [[nodiscard]] bool IsFloat() const noexcept;
     [[nodiscard]] bool IsSigned() const noexcept;
 
-    // True when this type can be assigned to `other` (lenient: Unknown is
-    // compatible with anything).
+    /// Whether this type is a primitive at all -- a bool, character, integer or float of any width.
+    [[nodiscard]] bool IsPrimitive() const noexcept;
+
+    /// True when this type can be assigned to `other` (lenient: Unknown is compatible with anything).
     [[nodiscard]] bool IsAssignableTo(const TypeRef &other) const noexcept;
+    /// Whether this value type can be implicitly borrowed as `other`. This answers only type compatibility; semantic
+    /// analysis separately requires addressable storage and write permission for an exclusive borrow.
+    [[nodiscard]] bool CanImplicitlyBorrowTo(const TypeRef &other) const noexcept;
     [[nodiscard]] std::optional<std::uint64_t> SizeInBytes() const noexcept;
     [[nodiscard]] std::string ToString() const;
+
+    /// The name a generic instantiation is identified by: `Base<Arg, Arg>`, or plain `Base` with no arguments. One
+    /// spelling, because a type is recorded, looked up, and compared by this string, and two spellings of it are two
+    /// types as far as every table keyed by it is concerned.
+    [[nodiscard]] static std::string InstantiationName(std::string_view base, const std::vector<TypeRef> &typeArgs);
 
     bool operator==(const TypeRef &other) const noexcept;
 

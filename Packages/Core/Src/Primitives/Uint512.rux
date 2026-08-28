@@ -1,0 +1,5 @@
+// Primitive constants are supplied directly by the compiler
+// uint512::Min
+// uint512::Max
+// uint512::Bits
+// uint512::Bytes

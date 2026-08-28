@@ -36,7 +36,7 @@ LirPackage CompileToLir(const std::string &source) {
     REQUIRE_FALSE(model.HasErrors());
 
     AstToHirLowering hirLowering(model);
-    HirToLirLowering lirLowering(hirLowering.Generate());
+    HirToLirLowering lirLowering(hirLowering.Generate(), context.target);
     return lirLowering.Generate();
 }
 
@@ -143,7 +143,7 @@ TEST_CASE("Panic requires an intrinsic declaration and enforces its signature") 
         func Main() { Panic("missing import"); }
     )");
     CHECK(std::ranges::any_of(undefinedDiagnostics, [](const SemanticDiagnostic &diagnostic) {
-        return diagnostic.message == "undefined name 'Panic'";
+        return diagnostic.message == "name 'Panic' is not defined in this scope";
     }));
 
     const auto signatureDiagnostics = Analyze(R"(
@@ -154,7 +154,8 @@ TEST_CASE("Panic requires an intrinsic declaration and enforces its signature") 
         }
     )");
     CHECK(std::ranges::any_of(signatureDiagnostics, [](const SemanticDiagnostic &diagnostic) {
-        return diagnostic.message == "no matching overload for 'Panic' with argument types (int)";
+        return diagnostic.message ==
+               "argument 1 to 'Panic' has type 'int', but parameter 'message' requires 'Slice<char8>'";
     }));
 }
 
